@@ -81,6 +81,8 @@ enum TransferErrorKind {
     ClockTimeout = 4,
     /// The RX or TX FIFO overflowed.
     Overflow = 5,
+    /// The controller went idle before the read buffer was filled.
+    InsufficientDataReceived = 6,
 }
 
 /// Transfer context structure.
@@ -277,8 +279,8 @@ impl I2c {
         }
 
         match transfer_type {
-            TransferType::Read => {
-                Self::on_interrupt_read(&mut regs, context);
+            TransferType::Read | TransferType::WriteReadReceiving => {
+                Self::on_interrupt_receive(&mut regs, context);
             }
             TransferType::Write => {
                 Self::on_interrupt_write(&mut regs, context);
@@ -286,14 +288,17 @@ impl I2c {
             TransferType::WriteRead => {
                 Self::on_interrupt_write_read(&mut regs, context, status);
             }
-            TransferType::WriteReadReceiving => {
-                Self::on_interrupt_write_read_receiving(&mut regs, context);
-            }
         }
         status
     }
 
-    fn on_interrupt_read(regs: &mut regs::MmioRegisters<'static>, context: &TransferContext) {
+    /// Handles the receive phase of [TransferType::Read] and [TransferType::WriteReadReceiving].
+    fn on_interrupt_receive(regs: &mut regs::MmioRegisters<'static>, context: &TransferContext) {
+        // Sampled before draining: once the controller is idle, every received byte is already
+        // in the FIFO. Sampling it afterwards could see a byte arrive between the drain and the
+        // check and count it as missing. If the transfer goes idle during the drain, the latched
+        // idle interrupt fires again.
+        let idle = regs.read_status().idle();
         let mut progress = context.state.rx_progress.load(Ordering::Relaxed);
         let slice = unsafe { context.state.rx_slice() };
         while regs.read_status().rx_not_empty() && progress < slice.len() {
@@ -301,10 +306,10 @@ impl I2c {
             progress += 1;
         }
         context.state.rx_progress.store(progress, Ordering::Relaxed);
-        // Checked after draining, not before: otherwise a byte that arrived and was
-        // drained on this same interrupt would need a whole extra interrupt just to
-        // notice `progress` is now complete.
-        if progress >= slice.len() && regs.read_status().idle() {
+        if idle {
+            if progress < slice.len() {
+                context.set_error(TransferErrorKind::InsufficientDataReceived);
+            }
             context.state.signal_done();
             regs.write_interrupt_enable(regs::InterruptControl::ZERO);
         }
@@ -357,27 +362,11 @@ impl I2c {
                     .with_cancel(false)
                     .build(),
             );
+            // The read phase completes on idle, which the controller only reaches after the
+            // STOP. The master NACK on the last byte comes before that, so it cannot be relied on
+            // to observe idle.
+            regs.modify_interrupt_enable(|value| value.with_idle(true));
             context.arm(TransferType::WriteReadReceiving);
-        }
-    }
-
-    fn on_interrupt_write_read_receiving(
-        regs: &mut regs::MmioRegisters<'static>,
-        context: &TransferContext,
-    ) {
-        let mut progress = context.state.rx_progress.load(Ordering::Relaxed);
-        let slice = unsafe { context.state.rx_slice() };
-        while regs.read_status().rx_not_empty() && progress < slice.len() {
-            slice[progress] = regs.read_data().data();
-            progress += 1;
-        }
-        context.state.rx_progress.store(progress, Ordering::Relaxed);
-        // Checked after draining, not before: otherwise a byte that arrived and was
-        // drained on this same interrupt would need a whole extra interrupt just to
-        // notice `progress` is now complete.
-        if progress >= slice.len() && regs.read_status().idle() {
-            context.state.signal_done();
-            regs.write_interrupt_enable(regs::InterruptControl::ZERO);
         }
     }
 
@@ -410,7 +399,7 @@ impl I2c {
         // and never disable interrupts again, since nothing about the real transaction has
         // started yet to ever make the completion condition true.
         self.0
-            .write_address(I2cAddress::Regular(address), regs::Direction::Send);
+            .write_address(I2cAddress::Regular(address), regs::Direction::Receive);
         self.0.write_command(super::I2cCommand::StartWithStop);
 
         self.0.regs.write_interrupt_enable(
@@ -572,11 +561,8 @@ impl I2c {
                 // FIFO drain condition.
                 .with_rx_ready(read.len() > FIFO_DEPTH)
                 .with_tx_ready(write_len > FIFO_DEPTH)
-                // Done status. Not needed here: `waiting` already signals the write phase's
-                // completion, and the read phase's completion comes from the master's own
-                // terminating NACK on the last byte (`nack_data`), so `idle` never has to be
-                // enabled as an interrupt source for this transfer. The handler still checks
-                // the live `status.idle()` bit itself in the completion condition.
+                // Done status. Enabled by the interrupt handler once the read phase starts,
+                // `waiting` signals the end of the write phase.
                 .with_idle(false)
                 // Will be set when the write part is finished.
                 .with_waiting(true)
@@ -661,6 +647,9 @@ impl core::future::Future for Transfer<'_> {
                         self.driver.0.regs.read_clk_timeout_limit().value(),
                     ),
                     TransferErrorKind::Overflow => super::Error::Overflow,
+                    TransferErrorKind::InsufficientDataReceived => {
+                        super::Error::InsufficientDataReceived
+                    }
                     _ => return core::task::Poll::Ready(Ok(())),
                 };
                 return core::task::Poll::Ready(Err(transfer_error));
