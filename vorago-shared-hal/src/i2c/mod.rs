@@ -604,6 +604,11 @@ impl<Addr> I2cMaster<Addr> {
                 return Err(Error::NackAddr);
             }
             if status.idle() {
+                // The controller goes idle once the last byte is on the wire, but earlier bytes
+                // can still sit in the FIFO if this loop was preempted.
+                while self.read_status().rx_not_empty() {
+                    self.read_next_byte(&mut buf_iter, &mut read_bytes);
+                }
                 if read_bytes != len {
                     return Err(Error::InsufficientDataReceived);
                 }
@@ -611,17 +616,28 @@ impl<Addr> I2cMaster<Addr> {
             }
             if timeout_guard.timeout_enabled() && self.regs.read_interrupt_status().clock_timeout()
             {
+                self.clear_rx_fifo();
                 return Err(Error::ClockTimeout(
                     self.regs.read_clk_timeout_limit().value(),
                 ));
             }
             if status.rx_not_empty() {
-                if let Some(next_byte) = buf_iter.next() {
-                    *next_byte = self.read_fifo_unchecked();
-                }
-                read_bytes += 1;
+                self.read_next_byte(&mut buf_iter, &mut read_bytes);
             }
         }
+    }
+
+    #[inline(always)]
+    fn read_next_byte<'a>(
+        &self,
+        buf_iter: &mut impl Iterator<Item = &'a mut u8>,
+        read_bytes: &mut usize,
+    ) {
+        let byte = self.read_fifo_unchecked();
+        if let Some(next_byte) = buf_iter.next() {
+            *next_byte = byte;
+        }
+        *read_bytes += 1;
     }
 
     fn write_blocking_generic(
