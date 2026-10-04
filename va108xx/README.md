@@ -1,4 +1,4 @@
-[![build](https://github.com/us-irs/vorago-rs/actions/workflows/va108xx.yml/badge.svg)](https://github.com/us-irs/vorago-rs/actions/workflows/va108xx.yml)
+[![build](https://github.com/ustgt-irs/vorago-rs/actions/workflows/va108xx.yml/badge.svg)](https://github.com/ustgt-irs/vorago-rs/actions/workflows/va108xx.yml)
 
 Vorago VA108xx Rust Support
 =========
@@ -10,30 +10,30 @@ of devices.
 
 This workspace contains the following released crates:
 
-- The [`va108xx`](https://egit.irs.uni-stuttgart.de/rust/vorago-rs/src/branch/main/va108xx/va108xx) PAC
+- The [`va108xx`](https://github.com/ustgt-irs/vorago-rs/tree/main/va108xx/va108xx) PAC
   crate containing basic low-level register definition.
-- The [`va108xx-hal`](https://egit.irs.uni-stuttgart.de/rust/vorago-rs/src/branch/main/va108xx/va108xx-hal)
+- The [`va108xx-hal`](https://github.com/ustgt-irs/vorago-rs/tree/main/va108xx/va108xx-hal)
   HAL crate containing higher-level abstractions on top of the PAC register crate.
-- The [`vorago-reb1`](https://egit.irs.uni-stuttgart.de/rust/vorago-rs/src/branch/main/va108xx/vorago-reb1)
+- The [`vorago-reb1`](https://github.com/ustgt-irs/vorago-rs/tree/main/va108xx/vorago-reb1)
   BSP crate containing support for the REB1 development board.
 
 It also contains the following helper crates:
 
-- The [`bootloader`](https://egit.irs.uni-stuttgart.de/rust/vorago-rs/src/branch/main/va108xx/bootloader)
+- The [`bootloader`](https://github.com/ustgt-irs/vorago-rs/tree/main/va108xx/bootloader)
   crate contains a sample bootloader strongly based on the one provided by Vorago.
-- The [`flashloader`](https://egit.irs.uni-stuttgart.de/rust/vorago-rs/src/branch/main/va108xx/flashloader)
+- The [`flashloader`](https://github.com/ustgt-irs/vorago-rs/tree/main/va108xx/flashloader)
   crate contains a sample flashloader which is able to update the redundant images in the NVM which
   is compatible to the provided bootloader as well.
-- The [`board-tests`](https://egit.irs.uni-stuttgart.de/rust/vorago-rs/src/branch/main/va108xx/board-tests)
+- The [`board-tests`](https://github.com/ustgt-irs/vorago-rs/tree/main/va108xx/board-tests)
   contains an application which can be used to test the libraries on the board.
-- The [`examples`](https://egit.irs.uni-stuttgart.de/rust/vorago-rs/src/branch/main/va108xx/examples)
+- The [`examples`](https://github.com/ustgt-irs/vorago-rs/tree/main/va108xx/examples)
   folder contains various example applications crates using the HAL and the PAC.
   This folder also contains dedicated example applications using the
   [`RTIC`](https://rtic.rs/2/book/en/) and [`embassy`](https://github.com/embassy-rs/embassy)
   native Rust RTOSes.
 
 The majority of the HAL implementation and the Embassy-rs support are contained in the external
-[`vorago-shared-hal`](https://egit.irs.uni-stuttgart.de/rust/vorago-rs/src/branch/main/vorago-shared-hal) crate.
+[`vorago-shared-hal`](https://github.com/ustgt-irs/vorago-rs/tree/main/vorago-shared-hal) crate.
 
 ## Using the `.cargo/config.toml` file
 

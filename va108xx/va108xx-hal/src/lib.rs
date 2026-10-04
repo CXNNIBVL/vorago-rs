@@ -1,14 +1,14 @@
 //! This is the **H**ardware **A**bstraction **L**ayer (HAL) for the VA108xx MCU family.
 //!
 //! It is an additional hardware abstraction on top of the
-//! [peripheral access API](https://egit.irs.uni-stuttgart.de/rust/vorago-rs/src/branch/main/va108xx/va108xx).
+//! [peripheral access API](https://github.com/ustgt-irs/vorago-rs/tree/main/va108xx/va108xx).
 //!
 //! It is the result of reading the datasheet for the device and encoding a type-safe layer over the
 //! raw PAC. This crate also implements traits specified by the
 //! [embedded-hal](https://github.com/rust-embedded/embedded-hal) project, making it compatible with
 //! various drivers in the embedded rust ecosystem.
 //!
-//! The [examples folder](https://github.com/us-irs/vorago-rs/tree/main/va108xx/examples) contains
+//! The [examples folder](https://github.com/ustgt-irs/vorago-rs/tree/main/va108xx/examples) contains
 //! various example applications using the HAL.
 #![no_std]
 #![deny(missing_docs)]

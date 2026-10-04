@@ -16,7 +16,7 @@
 //!
 //! # Example
 //!
-//! - [CAN example](https://egit.irs.uni-stuttgart.de/rust/vorago-rs/src/branch/main/va416xx/examples/embassy/src/bin/can.rs)
+//! - [CAN example](https://github.com/ustgt-irs/vorago-rs/blob/main/va416xx/examples/embassy/src/bin/can.rs)
 use core::sync::atomic::AtomicBool;
 
 use arbitrary_int::{prelude::*, u2, u3, u4, u7, u11, u15};

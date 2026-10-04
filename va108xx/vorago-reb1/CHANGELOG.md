@@ -70,8 +70,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
   it provides a starting point
 - Added ADC base library and example building on the new max116xx-10bit device driver crate
 
-[unreleased]: https://egit.irs.uni-stuttgart.de/rust/vorago-rs/compare/vorago-reb1-v0.10.0...HEAD
-[v0.10.0]: https://egit.irs.uni-stuttgart.de/rust/vorago-rs/src/tag/vorago-reb1-v0.10.0
+[unreleased]: https://github.com/ustgt-irs/vorago-rs/compare/vorago-reb1-v0.10.0...HEAD
+[v0.10.0]: https://github.com/ustgt-irs/vorago-rs/releases/tag/vorago-reb1-v0.10.0
 [v0.9.0]: https://egit.irs.uni-stuttgart.de/rust/va108xx-rs/compare/vorago-reb1-v0.8.1...vorago-reb1-v0.9.0
 [v0.8.1]: https://egit.irs.uni-stuttgart.de/rust/va108xx-rs/compare/vorago-reb1-v0.8.0...vorago-reb1-v0.8.1
 [v0.8.0]: https://egit.irs.uni-stuttgart.de/rust/va108xx-rs/compare/vorago-reb1-v0.7.0...vorago-reb1-v0.8.0

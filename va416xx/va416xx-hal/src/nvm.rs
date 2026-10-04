@@ -4,7 +4,7 @@
 //!
 //! # Examples
 //!
-//! - [Flashloader application](https://egit.irs.uni-stuttgart.de/rust/vorago-rs/src/branch/main/va416xx/flashloader)
+//! - [Flashloader application](https://github.com/ustgt-irs/vorago-rs/tree/main/va416xx/flashloader)
 use embedded_hal::spi::MODE_0;
 use vorago_shared_hal::spi::Spi3Instance as _;
 use vorago_shared_hal::{

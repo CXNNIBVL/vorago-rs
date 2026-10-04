@@ -341,10 +341,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 - README with basic instructions how to set up own binary crate
 
 
-[unreleased]: https://github.com/us-irs/vorago-rs/compare/va108xx-hal-v0.14.0...HEAD
-[v0.14.0]: https://github.com/us-irs/vorago-rs/releases/tag/va108xx-hal-v0.14.0
-[v0.13.1]: https://egit.irs.uni-stuttgart.de/rust/vorago-rs/compare/va108xx-hal-v0.13.0...va108xx-hal-v0.13.1
-[v0.13.0]: https://egit.irs.uni-stuttgart.de/rust/vorago-rs/src/tag/va108xx-hal-v0.13.0
+[unreleased]: https://github.com/ustgt-irs/vorago-rs/compare/va108xx-hal-v0.14.0...HEAD
+[v0.14.0]: https://github.com/ustgt-irs/vorago-rs/releases/tag/va108xx-hal-v0.14.0
+[v0.13.1]: https://github.com/ustgt-irs/vorago-rs/compare/va108xx-hal-v0.13.0...va108xx-hal-v0.13.1
+[v0.13.0]: https://github.com/ustgt-irs/vorago-rs/releases/tag/va108xx-hal-v0.13.0
 [v0.12.0]: https://egit.irs.uni-stuttgart.de/rust/va108xx-rs/compare/va108xx-hal-v0.11.1...va108xx-hal-v0.12.0
 [v0.11.1]: https://egit.irs.uni-stuttgart.de/rust/va108xx-rs/compare/va108xx-hal-v0.11.0...va108xx-hal-v0.11.1
 [v0.11.0]: https://egit.irs.uni-stuttgart.de/rust/va108xx-rs/compare/va108xx-hal-v0.10.0...va108xx-hal-v0.11.0

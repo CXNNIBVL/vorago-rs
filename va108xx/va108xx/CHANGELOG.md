@@ -92,8 +92,8 @@ defmt version v1
 - First version of the PAC which builds. Uses a patched version
   of `svd2rust`: https://github.com/rust-embedded/svd2rust
 
-[unreleased]: https://egit.irs.uni-stuttgart.de/rust/vorago-rs/compare/va108xx-v0.6.1...HEAD
-[v0.6.1]: https://egit.irs.uni-stuttgart.de/rust/vorago-rs/src/tag/va108xx-v0.6.1
+[unreleased]: https://github.com/ustgt-irs/vorago-rs/compare/va108xx-v0.6.1...HEAD
+[v0.6.1]: https://github.com/ustgt-irs/vorago-rs/releases/tag/va108xx-v0.6.1
 [v0.6.0]: https://egit.irs.uni-stuttgart.de/rust/va108xx-rs/compare/va108xx-v0.5.1...va108xx-v0.6.0
 [v0.5.1]: https://egit.irs.uni-stuttgart.de/rust/va108xx-rs/compare/va108xx-v0.5.0...va108xx-v0.5.1
 [v0.5.0]: https://egit.irs.uni-stuttgart.de/rust/va108xx-rs/compare/va108xx-v0.4.0...va108xx-v0.5.0

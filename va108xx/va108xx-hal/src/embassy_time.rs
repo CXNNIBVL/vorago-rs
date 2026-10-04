@@ -29,7 +29,7 @@
 //!
 //! ## Examples
 //!
-//! [embassy example projects](https://egit.irs.uni-stuttgart.de/rust/vorago-rs/src/branch/main/va108xx/examples/embassy)
+//! [embassy example projects](https://github.com/ustgt-irs/vorago-rs/tree/main/va108xx/examples/embassy)
 
 #[cfg(feature = "_irqs-in-lib")]
 use crate::pac::{self, interrupt};

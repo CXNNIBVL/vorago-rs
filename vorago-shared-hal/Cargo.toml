@@ -3,8 +3,7 @@ name = "vorago-shared-hal"
 version = "0.5.0"
 description = "Peripheral HAL components shared between Vorago families"
 edition = "2024"
-homepage = "https://github.com/us-irs/vorago-rs"
-repository = "https://git.irs.uni-stuttgart.de/irs/vorago-rs"
+repository = "https://github.com/ustgt-irs/vorago-rs"
 license = "Apache-2.0"
 
 [dependencies]

@@ -1,7 +1,7 @@
 //! This is the **H**ardware **A**bstraction **L**ayer (HAL) for the VA416xx MCU family.
 //!
 //! It is an additional hardware abstraction on top of the
-//! [peripheral access API](https://egit.irs.uni-stuttgart.de/rust/vorago-rs/src/branch/main/va416xx/va416xx).
+//! [peripheral access API](https://github.com/ustgt-irs/vorago-rs/tree/main/va416xx/va416xx).
 //!
 //! It is the result of reading the datasheet for the device and encoding a type-safe layer over the
 //! raw PAC. This crate also implements traits specified by the
@@ -26,7 +26,7 @@
 //! [crate::irq_router] module at the very least because that peripheral has confusing and/or
 //! faulty register reset values which might lead to weird bugs and glitches.
 //!
-//! The [examples folder](https://github.com/us-irs/vorago-rs/tree/main/va416xx/examples) contains
+//! The [examples folder](https://github.com/ustgt-irs/vorago-rs/tree/main/va416xx/examples) contains
 //! various example applications using the HAL.
 #![no_std]
 #![deny(missing_docs)]
