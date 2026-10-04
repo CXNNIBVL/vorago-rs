@@ -2,7 +2,7 @@ use core::cell::Cell;
 
 use crate::{
     i2c::{
-        FIFO_DEPTH, I2cAddress,
+        Address, FIFO_DEPTH,
         regs::{self, Command, Data, InterruptClear},
     },
     shared::asynch::TransferState,
@@ -256,8 +256,8 @@ impl I2c {
         // `nack_data` only indicates a real failure while transmitting: a slave NACKing a byte
         // we wrote. On a receive, the *master* NACKs the last byte itself to end the transfer,
         // which is normal termination, not a slave failure, but sets the same bit. The blocking
-        // driver makes the same distinction: `write_blocking_generic` checks this, `read_blocking`
-        // does not.
+        // driver makes the same distinction: `write_internal` checks this, `read_internal` does
+        // not.
         let nack_data_is_error = match transfer_type {
             TransferType::Read => false,
             TransferType::Write => true,
@@ -399,8 +399,8 @@ impl I2c {
         // and never disable interrupts again, since nothing about the real transaction has
         // started yet to ever make the completion condition true.
         self.0
-            .write_address(I2cAddress::Regular(address), regs::Direction::Receive);
-        self.0.write_command(super::I2cCommand::StartWithStop);
+            .write_address_and_direction(Address::Regular(address), regs::Direction::Receive);
+        self.0.write_command(super::Command::StartWithStop);
 
         self.0.regs.write_interrupt_enable(
             regs::InterruptControl::builder()
@@ -469,8 +469,8 @@ impl I2c {
         // See the comment in `read` on why the address/command must be issued before
         // interrupts are enabled.
         self.0
-            .write_address(I2cAddress::Regular(address), regs::Direction::Send);
-        self.0.write_command(super::I2cCommand::StartWithStop);
+            .write_address_and_direction(Address::Regular(address), regs::Direction::Send);
+        self.0.write_command(super::Command::StartWithStop);
 
         self.0.regs.write_interrupt_enable(
             regs::InterruptControl::builder()
@@ -546,8 +546,8 @@ impl I2c {
         // See the comment in `read` on why the address/command must be issued before
         // interrupts are enabled.
         self.0
-            .write_address(I2cAddress::Regular(address), regs::Direction::Send);
-        self.0.write_command(super::I2cCommand::Start);
+            .write_address_and_direction(Address::Regular(address), regs::Direction::Send);
+        self.0.write_command(super::Command::Start);
 
         self.0.regs.write_interrupt_enable(
             regs::InterruptControl::builder()

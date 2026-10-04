@@ -11,7 +11,7 @@ use arbitrary_int::{traits::Integer, u4, u10, u11, u20};
 use core::marker::PhantomData;
 use embedded_hal::i2c::{self, Operation, SevenBitAddress, TenBitAddress};
 use regs::ClockTimeoutLimit;
-pub use regs::{Bank, I2cSpeed, RxFifoFullMode, TxFifoEmptyMode};
+pub use regs::{Bank, I2cSpeed};
 
 #[cfg(feature = "vor1x")]
 use va108xx as pac;
@@ -31,6 +31,10 @@ pub const MIN_CLK_400K: Hertz = Hertz::from_raw(8_000_000);
 
 /// Depth of the TX and RX FIFOs, in words.
 pub const FIFO_DEPTH: usize = 16;
+
+/// Maximum word count for one transfer supported by the hardware. Consecutive operations with
+/// the same direction are merged into one transfer, so this limit applies to their sum.
+pub const MAX_WORD_COUNT: usize = 0x7fe;
 
 /// The configured clock is too slow to reach the requested I2C fast mode speed.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -103,7 +107,7 @@ impl embedded_hal::i2c::Error for Error {
 /// Command written to the COMMAND register to control a transaction.
 #[derive(Debug, PartialEq, Copy, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum I2cCommand {
+pub enum Command {
     /// Issue a START condition.
     Start = 0b01,
     /// Issue a STOP condition.
@@ -117,28 +121,40 @@ pub enum I2cCommand {
 /// Slave address, either 7-bit or 10-bit.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum I2cAddress {
+pub enum Address {
     /// 7-bit address.
     Regular(u8),
     /// 10-bit address.
     TenBit(u16),
 }
 
-impl I2cAddress {
+impl Address {
     /// Whether this is a 10-bit address.
     pub fn ten_bit_addr(&self) -> bool {
         match self {
-            I2cAddress::Regular(_) => false,
-            I2cAddress::TenBit(_) => true,
+            Address::Regular(_) => false,
+            Address::TenBit(_) => true,
         }
     }
 
     /// The raw address value.
     pub fn raw(&self) -> u16 {
         match self {
-            I2cAddress::Regular(addr) => *addr as u16,
-            I2cAddress::TenBit(addr) => *addr,
+            Address::Regular(addr) => *addr as u16,
+            Address::TenBit(addr) => *addr,
         }
+    }
+}
+
+impl From<SevenBitAddress> for Address {
+    fn from(addr: SevenBitAddress) -> Self {
+        Address::Regular(addr)
+    }
+}
+
+impl From<TenBitAddress> for Address {
+    fn from(addr: TenBitAddress) -> Self {
+        Address::TenBit(addr)
     }
 }
 
@@ -249,10 +265,6 @@ impl Default for TimingConfig {
 /// Configuration for [I2cMaster::new].
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct MasterConfig {
-    /// Behavior when the TX FIFO is empty.
-    pub tx_empty_mode: TxFifoEmptyMode,
-    /// Behavior when the RX FIFO is full.
-    pub rx_full_mode: RxFifoFullMode,
     /// Enable the analog delay glitch filter
     pub alg_filt: bool,
     /// Enable the digital glitch filter
@@ -268,8 +280,6 @@ pub struct MasterConfig {
 impl Default for MasterConfig {
     fn default() -> Self {
         MasterConfig {
-            tx_empty_mode: TxFifoEmptyMode::Stall,
-            rx_full_mode: RxFifoFullMode::Stall,
             alg_filt: false,
             dlg_filt: false,
             timeout: Some(u20::MAX),
@@ -281,9 +291,26 @@ impl Default for MasterConfig {
 impl Sealed for MasterConfig {}
 
 #[derive(Debug, PartialEq, Eq)]
-enum WriteCompletionCondition {
+enum CompletionCondition {
     Idle,
     Waiting,
+}
+
+impl CompletionCondition {
+    fn for_command(cmd: Command) -> Self {
+        match cmd {
+            // Without a stop, the controller holds the bus and waits for the next command.
+            Command::Start => Self::Waiting,
+            Command::Stop | Command::StartWithStop | Command::Cancel => Self::Idle,
+        }
+    }
+
+    fn is_met(&self, status: regs::Status) -> bool {
+        match self {
+            Self::Idle => status.idle(),
+            Self::Waiting => status.waiting(),
+        }
+    }
 }
 
 struct TimeoutGuard {
@@ -364,8 +391,10 @@ impl<Addr> I2cMaster<Addr> {
                 .build(),
         );
         regs.modify_control(|mut value| {
-            value.set_tx_fifo_empty_mode(cfg.tx_empty_mode);
-            value.set_rx_fifo_full_mode(cfg.rx_full_mode);
+            // Stalling is required to merge consecutive operations of the same direction into
+            // one transfer, as the embedded-hal transaction contract demands.
+            value.set_tx_fifo_empty_mode(regs::TxFifoEmptyMode::Stall);
+            value.set_rx_fifo_full_mode(regs::RxFifoFullMode::Stall);
             value.set_analog_filter(cfg.alg_filt);
             value.set_digital_filter(cfg.dlg_filt);
             value
@@ -530,20 +559,20 @@ impl<Addr> I2cMaster<Addr> {
 
     /// Read the STATUS register.
     #[inline]
-    pub fn read_status(&mut self) -> regs::Status {
+    pub fn read_status(&self) -> regs::Status {
         self.regs.read_status()
     }
 
     /// Write a command to the COMMAND register.
     #[inline]
-    pub fn write_command(&mut self, cmd: I2cCommand) {
+    pub fn write_command(&mut self, cmd: Command) {
         self.regs
             .write_command(regs::Command::new_with_raw_value(cmd as u32));
     }
 
     /// Write the target address and transfer direction to the ADDRESS register.
     #[inline]
-    pub fn write_address(&mut self, addr: I2cAddress, dir: regs::Direction) {
+    pub fn write_address_and_direction(&mut self, addr: Address, dir: regs::Direction) {
         self.regs.write_address(
             regs::Address::builder()
                 .with_direction(dir)
@@ -553,179 +582,261 @@ impl<Addr> I2cMaster<Addr> {
         );
     }
 
-    fn error_handler_write(&mut self, init_cmd: I2cCommand) {
-        if init_cmd == I2cCommand::Start {
-            self.write_command(I2cCommand::Stop);
+    /// A group started with [Command::Start] leaves the controller holding the bus after an
+    /// error, so it has to be released with an explicit stop. For [Command::StartWithStop],
+    /// the hardware already takes care of it.
+    fn release_bus_on_error(&mut self, group_command: Command) {
+        if group_command == Command::Start {
+            self.write_command(Command::Stop);
         }
-        // The other case is start with stop where, so a CANCEL command should not be necessary
-        // because the hardware takes care of it.
+    }
+
+    /// Every I2C transfer goes through this function which makes it easier to meet all
+    /// I2C HAL trait contracts.
+    ///
+    /// Empty reads are ignored. Empty writes address the target without data, which can be
+    /// used to probe for a device.
+    pub fn transaction(&mut self, addr: Addr, operations: &mut [Operation<'_>]) -> Result<(), Error>
+    where
+        Addr: Into<Address>,
+    {
+        let addr = addr.into();
+        if operations.is_empty() {
+            return Ok(());
+        }
+        // Checked up front so an invalid transaction does not leave the bus held by an
+        // earlier group.
+        check_group_lengths(operations)?;
+        let ops_len = operations.len();
         self.clear_tx_fifo();
-    }
-
-    /// Blocking write transaction on the I2C bus.
-    pub fn write_blocking(&mut self, addr: I2cAddress, output: &[u8]) -> Result<(), Error> {
-        self.write_blocking_generic(
-            I2cCommand::StartWithStop,
-            addr,
-            output,
-            WriteCompletionCondition::Idle,
-        )
-    }
-
-    /// Blocking read transaction on the I2C bus.
-    pub fn read_blocking(&mut self, addr: I2cAddress, buffer: &mut [u8]) -> Result<(), Error> {
-        let len = buffer.len();
-        if len > 0x7fe {
-            return Err(Error::DataTooLarge);
-        }
-        // Clear the receive FIFO
         self.clear_rx_fifo();
-
         let timeout_guard = TimeoutGuard::new(&self.regs);
 
-        // Load number of words
-        self.regs
-            .write_words(regs::Words::new(u11::new(len as u16)));
-        // Load address
-        self.write_address(addr, regs::Direction::Receive);
+        // Empty reads are skipped entirely. The hardware can not do a zero-length read, and
+        // skipping them in all lookups below ensures they never split or end a merged transfer.
+        let mut prev_dir = None;
+        let mut group_command = Command::Start;
+        for i in 0..ops_len {
+            if is_empty_read(&operations[i]) {
+                continue;
+            }
+            // Consecutive operations with the same direction are merged into one group, which
+            // is a single hardware transfer. The command is only written for the first operation
+            // of a group:
+            //  - ST = Start condition
+            //  - SR = Repeated start
+            //  - SP = Stop condition
+            //
+            // [W] -> ST + SP on W
+            // [W, R] -> ST on W, SR + SP on R
+            // [W, W] -> ST + SP on first W, the group covers both
+            // [W, R, W] -> ST on first W, SR on R, SR + SP on last W
+            //
+            // The last group uses StartWithStop, so the hardware issues the stop condition once
+            // the word count is done. All other groups use Start, which leaves the controller
+            // waiting for the repeated start of the next group.
+            let dir = op_direction(&operations[i]);
+            let next_dir = operations[i + 1..]
+                .iter()
+                .find(|op| !is_empty_read(op))
+                .map(op_direction);
 
-        let mut buf_iter = buffer.iter_mut();
-        let mut read_bytes = 0;
-        // Start receive transfer
-        self.write_command(I2cCommand::StartWithStop);
+            // Either the first operation or a direction change.
+            let first_op_in_group = prev_dir != Some(dir);
+            // Only used for the first operation of a group. The look ahead below adds the lengths
+            // of the other operations in the group.
+            let mut group_len = match &operations[i] {
+                Operation::Read(items) => items.len(),
+                Operation::Write(items) => items.len(),
+            };
+            let more_ops_in_group = next_dir == Some(dir);
+
+            if first_op_in_group {
+                // Assume this is the last group until the look ahead finds a direction change.
+                group_command = Command::StartWithStop;
+                for next_op in operations[i + 1..].iter().filter(|op| !is_empty_read(op)) {
+                    if op_direction(next_op) != dir {
+                        group_command = Command::Start;
+                        break;
+                    }
+
+                    match next_op {
+                        Operation::Read(items) => group_len += items.len(),
+                        Operation::Write(items) => group_len += items.len(),
+                    }
+                }
+                // A zero-length write group is still sent. It addresses the target without data,
+                // which is a valid way to probe for a device.
+                self.regs
+                    .write_words(regs::Words::new(u11::new(group_len as u16)));
+                self.write_address_and_direction(addr, dir);
+            }
+            match &mut operations[i] {
+                Operation::Read(items) => self.read_internal(
+                    items,
+                    group_command,
+                    first_op_in_group,
+                    timeout_guard.timeout_enabled(),
+                    more_ops_in_group,
+                )?,
+                Operation::Write(items) => self.write_internal(
+                    items,
+                    group_command,
+                    first_op_in_group,
+                    timeout_guard.timeout_enabled(),
+                    more_ops_in_group,
+                )?,
+            }
+            prev_dir = Some(dir);
+        }
+        Ok(())
+    }
+
+    fn write_internal(
+        &mut self,
+        output: &[u8],
+        group_command: Command,
+        first_op_of_group: bool,
+        timeout_enabled: bool,
+        more_ops_in_group: bool,
+    ) -> Result<(), Error> {
+        let mut bytes = output.iter().copied().peekable();
+        // Pre-fill the FIFO so the controller has data as soon as the command starts the transfer.
+        while self.read_status().tx_not_full()
+            && let Some(byte) = bytes.next()
+        {
+            self.write_fifo_unchecked(byte);
+        }
+        if first_op_of_group {
+            self.write_command(group_command);
+        }
+        let completion = CompletionCondition::for_command(group_command);
+        loop {
+            let status = self.regs.read_status();
+            if status.arb_lost() {
+                self.release_bus_on_error(group_command);
+                self.clear_tx_fifo();
+                return Err(Error::ArbitrationLost);
+            }
+            if status.nack_addr() {
+                self.release_bus_on_error(group_command);
+                self.clear_tx_fifo();
+                return Err(Error::NackAddr);
+            }
+            if status.nack_data() {
+                self.release_bus_on_error(group_command);
+                self.clear_tx_fifo();
+                return Err(Error::NackData);
+            }
+            if completion.is_met(status) {
+                return Ok(());
+            }
+            if timeout_enabled && self.regs.read_interrupt_status().clock_timeout() {
+                self.cancel_transfer();
+                self.clear_tx_fifo();
+                return Err(Error::ClockTimeout(
+                    self.regs.read_clk_timeout_limit().value(),
+                ));
+            }
+            if status.tx_not_full()
+                && let Some(byte) = bytes.next()
+            {
+                self.write_fifo_unchecked(byte);
+            }
+            if more_ops_in_group && bytes.peek().is_none() {
+                return Ok(());
+            }
+        }
+    }
+
+    fn read_internal(
+        &mut self,
+        buffer: &mut [u8],
+        group_command: Command,
+        first_op_in_group: bool,
+        timeout_enabled: bool,
+        more_ops_in_group: bool,
+    ) -> Result<(), Error> {
+        let full_len = buffer.len();
+        let mut byte_index = 0;
+        let completion = CompletionCondition::for_command(group_command);
+        if first_op_in_group {
+            self.write_command(group_command);
+        }
         loop {
             let status = self.read_status();
+
             if status.arb_lost() {
+                self.release_bus_on_error(group_command);
                 self.clear_rx_fifo();
                 return Err(Error::ArbitrationLost);
             }
             if status.nack_addr() {
+                self.release_bus_on_error(group_command);
                 self.clear_rx_fifo();
                 return Err(Error::NackAddr);
             }
-            if status.idle() {
+            if timeout_enabled && self.regs.read_interrupt_status().clock_timeout() {
+                self.cancel_transfer();
+                self.clear_rx_fifo();
+                return Err(Error::ClockTimeout(
+                    self.regs.read_clk_timeout_limit().value(),
+                ));
+            }
+            let drain_rx_fifo = |buffer: &mut [u8], byte_index: &mut usize| {
+                while self.read_status().rx_not_empty() && *byte_index < full_len {
+                    let byte = self.read_fifo_unchecked();
+                    buffer[*byte_index] = byte;
+                    *byte_index += 1;
+                }
+            };
+
+            drain_rx_fifo(buffer, &mut byte_index);
+            if byte_index == full_len && more_ops_in_group {
+                return Ok(());
+            }
+
+            if completion.is_met(status) {
                 // The controller goes idle once the last byte is on the wire, but earlier bytes
                 // can still sit in the FIFO if this loop was preempted.
-                while self.read_status().rx_not_empty() {
-                    self.read_next_byte(&mut buf_iter, &mut read_bytes);
-                }
-                if read_bytes != len {
+                drain_rx_fifo(buffer, &mut byte_index);
+                if byte_index != full_len {
                     return Err(Error::InsufficientDataReceived);
                 }
                 return Ok(());
             }
-            if timeout_guard.timeout_enabled() && self.regs.read_interrupt_status().clock_timeout()
-            {
-                self.clear_rx_fifo();
-                return Err(Error::ClockTimeout(
-                    self.regs.read_clk_timeout_limit().value(),
-                ));
-            }
-            if status.rx_not_empty() {
-                self.read_next_byte(&mut buf_iter, &mut read_bytes);
-            }
         }
     }
+}
 
-    #[inline(always)]
-    fn read_next_byte<'a>(
-        &self,
-        buf_iter: &mut impl Iterator<Item = &'a mut u8>,
-        read_bytes: &mut usize,
-    ) {
-        let byte = self.read_fifo_unchecked();
-        if let Some(next_byte) = buf_iter.next() {
-            *next_byte = byte;
-        }
-        *read_bytes += 1;
+fn op_direction(op: &Operation<'_>) -> regs::Direction {
+    match op {
+        Operation::Read(_) => regs::Direction::Receive,
+        Operation::Write(_) => regs::Direction::Send,
     }
+}
+fn is_empty_read(op: &Operation<'_>) -> bool {
+    matches!(op, Operation::Read(buf) if buf.is_empty())
+}
 
-    fn write_blocking_generic(
-        &mut self,
-        init_cmd: I2cCommand,
-        addr: I2cAddress,
-        output: &[u8],
-        end_condition: WriteCompletionCondition,
-    ) -> Result<(), Error> {
-        let len = output.len();
-        if len > 0x7fe {
+fn check_group_lengths(operations: &[Operation<'_>]) -> Result<(), Error> {
+    let mut prev_dir = None;
+    let mut group_len = 0;
+    for op in operations.iter().filter(|op| !is_empty_read(op)) {
+        let dir = op_direction(op);
+        if prev_dir != Some(dir) {
+            group_len = 0;
+        }
+        group_len += match op {
+            Operation::Read(items) => items.len(),
+            Operation::Write(items) => items.len(),
+        };
+        if group_len > MAX_WORD_COUNT {
             return Err(Error::DataTooLarge);
         }
-        // Clear the send FIFO
-        self.clear_tx_fifo();
-
-        let timeout_guard = TimeoutGuard::new(&self.regs);
-
-        // Load number of words
-        self.regs
-            .write_words(regs::Words::new(u11::new(len as u16)));
-        let mut bytes = output.iter();
-        // FIFO has a depth of 16. We load slightly above the trigger level
-        // but not all of it because the transaction might fail immediately
-        const FILL_DEPTH: usize = 12;
-
-        let mut current_index = core::cmp::min(FILL_DEPTH, len);
-        // load the FIFO
-        for _ in 0..current_index {
-            self.write_fifo_unchecked(*bytes.next().unwrap());
-        }
-        self.write_address(addr, regs::Direction::Send);
-        self.write_command(init_cmd);
-        loop {
-            let status = self.regs.read_status();
-            if status.arb_lost() {
-                self.error_handler_write(init_cmd);
-                return Err(Error::ArbitrationLost);
-            }
-            if status.nack_addr() {
-                self.error_handler_write(init_cmd);
-                return Err(Error::NackAddr);
-            }
-            if status.nack_data() {
-                self.error_handler_write(init_cmd);
-                return Err(Error::NackData);
-            }
-            match end_condition {
-                WriteCompletionCondition::Idle => {
-                    if status.idle() {
-                        return Ok(());
-                    }
-                }
-
-                WriteCompletionCondition::Waiting => {
-                    if status.waiting() {
-                        return Ok(());
-                    }
-                }
-            }
-            if timeout_guard.timeout_enabled() && self.regs.read_interrupt_status().clock_timeout()
-            {
-                return Err(Error::ClockTimeout(
-                    self.regs.read_clk_timeout_limit().value(),
-                ));
-            }
-            if status.tx_not_full() && current_index < len {
-                self.write_fifo_unchecked(output[current_index]);
-                current_index += 1;
-            }
-        }
+        prev_dir = Some(dir);
     }
-
-    /// Blocking write-read transaction on the I2C bus.
-    pub fn write_read_blocking(
-        &mut self,
-        address: I2cAddress,
-        write: &[u8],
-        read: &mut [u8],
-    ) -> Result<(), Error> {
-        self.write_blocking_generic(
-            I2cCommand::Start,
-            address,
-            write,
-            WriteCompletionCondition::Waiting,
-        )?;
-        self.read_blocking(address, read)
-    }
+    Ok(())
 }
 
 impl I2cMaster<SevenBitAddress> {
@@ -746,6 +857,28 @@ impl I2cMaster<SevenBitAddress> {
     }
 }
 
+/// Inherent versions of the [embedded_hal::i2c::I2c] methods, so they can be used without
+/// importing the trait.
+impl<Addr: i2c::AddressMode> I2cMaster<Addr>
+where
+    Self: i2c::I2c<Addr, Error = Error>,
+{
+    /// Blocking write transaction on the I2C bus.
+    pub fn write(&mut self, addr: Addr, output: &[u8]) -> Result<(), Error> {
+        <Self as i2c::I2c<Addr>>::write(self, addr, output)
+    }
+
+    /// Blocking read transaction on the I2C bus.
+    pub fn read(&mut self, addr: Addr, buf: &mut [u8]) -> Result<(), Error> {
+        <Self as i2c::I2c<Addr>>::read(self, addr, buf)
+    }
+
+    /// Blocking write-read transaction on the I2C bus.
+    pub fn write_read(&mut self, addr: Addr, write: &[u8], read: &mut [u8]) -> Result<(), Error> {
+        <Self as i2c::I2c<Addr>>::write_read(self, addr, write, read)
+    }
+}
+
 //======================================================================================
 // Embedded HAL I2C implementations
 //======================================================================================
@@ -760,23 +893,7 @@ impl embedded_hal::i2c::I2c for I2cMaster<SevenBitAddress> {
         address: SevenBitAddress,
         operations: &mut [Operation<'_>],
     ) -> Result<(), Self::Error> {
-        for operation in operations {
-            match operation {
-                Operation::Read(buf) => self.read_blocking(I2cAddress::Regular(address), buf)?,
-                Operation::Write(buf) => self.write_blocking(I2cAddress::Regular(address), buf)?,
-            }
-        }
-        Ok(())
-    }
-
-    fn write_read(
-        &mut self,
-        address: u8,
-        write: &[u8],
-        read: &mut [u8],
-    ) -> Result<(), Self::Error> {
-        let addr = I2cAddress::Regular(address);
-        self.write_read_blocking(addr, write, read)
+        self.transaction(address, operations)
     }
 }
 
@@ -790,22 +907,6 @@ impl embedded_hal::i2c::I2c<TenBitAddress> for I2cMaster<TenBitAddress> {
         address: TenBitAddress,
         operations: &mut [Operation<'_>],
     ) -> Result<(), Self::Error> {
-        for operation in operations {
-            match operation {
-                Operation::Read(buf) => self.read_blocking(I2cAddress::TenBit(address), buf)?,
-                Operation::Write(buf) => self.write_blocking(I2cAddress::TenBit(address), buf)?,
-            }
-        }
-        Ok(())
-    }
-
-    fn write_read(
-        &mut self,
-        address: TenBitAddress,
-        write: &[u8],
-        read: &mut [u8],
-    ) -> Result<(), Self::Error> {
-        let addr = I2cAddress::TenBit(address);
-        self.write_read_blocking(addr, write, read)
+        self.transaction(address, operations)
     }
 }

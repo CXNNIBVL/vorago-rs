@@ -11,9 +11,20 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 ### Added
 
 - Re-export `MODE_0` to `MODE_3` from `spi`.
+- I2C write,read transcation and write_read are now inherent method
+  usable without needing to import the trait
+- `From<u8>` and `From<u16>` for `i2c::Address`.
+- `i2c::MAX_WORD_COUNT`, the maximum length of one I2C transfer.
 
 ### Changed
 
+- I2C contract fixes and blocking module update
+- Consecutive operations of the same direction are now merged and done in one hardware transaction
+- Renamed `i2c::I2cAddress` to `Address` and `i2c::I2cCommand` to `Command`.
+- Renamed `I2cMaster::write_address` to `write_address_and_direction`.
+- Replaced `I2cMaster::write_blocking`, `read_blocking` and `write_read_blocking` with `write`,
+  `read` and `write_read`. They take the address type of the master (`u8` or `u16`) instead of
+  `I2cAddress`.
 - The async SPI driver's interrupt handler no longer takes a critical section on every
   interrupt. The shared transfer state moved from a `Mutex<RefCell<TransferContext>>` to plain
   atomics, gated by an `Acquire`/`Release` flag that publishes the transfer buffers. The waker
@@ -62,6 +73,9 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 - Several I2C register accessors were renamed for consistency: `cmd` became `command`, and
   `irq_enb`/`irq_raw`/`irq_status`/`irq_clear` became `interrupt_enable`/`interrupt_raw`/
   `interrupt_status`/`interrupt_clear`.
+- Removed `tx_empty_mode` and `rx_full_mode` from the I2C `MasterConfig`. The master now always
+  stalls on an empty TX or full RX FIFO, which is required to meet the embedded-hal transaction
+  contract. `TxFifoEmptyMode` and `RxFifoFullMode` are no longer re-exported from `i2c`.
 
 ### Fixed
 
@@ -69,6 +83,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
   async driver disabled blockmode and never set the BMSTART_BMSTOP bit, so CS stayed asserted.
 - Cancelling an async SPI transfer now ends the blockmode frame. Dropping a transfer future only
   cleared the FIFOs, which leaves the frame open and the chip select asserted.
+- Fixed the I2C blocking module to properly implement the embedded HAL I2C trait contract.
+- I2C empty reads are skipped
+- An I2C clock timeout now cancels the transfer and clears the FIFO
+- I2C `DataTooLarge` is now checked before any bus activity.
+- The I2C bus is now released after an error in the middle of a transaction.
 
 ## [v0.5.0] 2026-07-14
 
