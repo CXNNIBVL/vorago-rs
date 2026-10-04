@@ -7,7 +7,7 @@ which can be used to upload compiled images to the flashloader application to wr
 You can find it inside the `tools/va108xx-image-loader` directory of the monorepo.
 
 Please note that the both the application and the image loader are tailored towards usage
-with the [bootloader provided by this repository](https://egit.irs.uni-stuttgart.de/rust/vorago-rs/src/branch/main/va108xx/bootloader).
+with the [bootloader provided by this repository](https://github.com/ustgt-irs/vorago-rs/tree/main/va108xx/bootloader).
 
 The flashloader software could be be adapted to interface with a real primary on-board software
 instead of the loader application provided here to upload images because it already uses a

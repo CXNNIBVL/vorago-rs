@@ -28,7 +28,7 @@ of time before booting. This allows to catch the RTT printout, but should probab
 for production firmware.
 
 This bootloader does not provide tools to flash the NVM memory by itself. Instead, you can use
-the [flashloader](https://egit.irs.uni-stuttgart.de/rust/vorago-rs/src/branch/main/va108xx/flashloader)
+the [flashloader](https://github.com/ustgt-irs/vorago-rs/tree/main/va108xx/flashloader)
 application to perform this task using a CCSDS interface via a UART.
 
 The bootloader performs the following steps:
