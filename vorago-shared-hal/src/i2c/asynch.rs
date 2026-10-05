@@ -1,14 +1,12 @@
-use core::cell::Cell;
+use core::{cell::Cell, marker::PhantomData};
 
-use crate::{
-    i2c::{
-        Address, FIFO_DEPTH,
-        regs::{self, Command, Data, InterruptClear},
-    },
-    shared::asynch::TransferState,
+use crate::i2c::{
+    Address, FIFO_DEPTH, check_group_lengths, next_group, next_op, op_direction, op_len, regs,
 };
-use arbitrary_int::u11;
-use portable_atomic::{AtomicU8, Ordering};
+use arbitrary_int::{u5, u11};
+use embassy_sync::waitqueue::AtomicWaker;
+use embedded_hal::i2c::Operation;
+use portable_atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 
 #[cfg(feature = "vor1x")]
 use crate::InterruptConfig;
@@ -21,42 +19,6 @@ pub const NUM_I2C: usize = 2;
 pub const NUM_I2C: usize = 3;
 
 static TRANSFER_CONTEXTS: [TransferContext; NUM_I2C] = [const { TransferContext::new() }; NUM_I2C];
-
-/// Kind of transfer an async [Transfer] is performing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[repr(u8)]
-pub enum TransferType {
-    /// A read transfer.
-    Read = 0,
-    /// A write transfer.
-    Write = 1,
-    /// A simultaneous read and write transfer, still in the write phase.
-    WriteRead = 2,
-    /// A simultaneous read and write transfer, in the read phase.
-    ///
-    /// `waiting` is not clearable and stays set for the remainder of the transfer once
-    /// observed, so it cannot be used to tell whether the read phase's `Start`/`Stop` was
-    /// already issued. This variant is the gate's own record of that instead: the interrupt
-    /// handler transitions [TransferType::WriteRead] to this exactly once, the first time
-    /// `waiting` is observed, so the read phase is only ever kicked off a single time.
-    WriteReadReceiving = 3,
-}
-
-impl TransferType {
-    /// Stored in [TransferContext::transfer_type] while no transfer is active.
-    const NONE: u8 = 0xff;
-
-    const fn from_raw(raw: u8) -> Option<Self> {
-        match raw {
-            0 => Some(Self::Read),
-            1 => Some(Self::Write),
-            2 => Some(Self::WriteRead),
-            3 => Some(Self::WriteReadReceiving),
-            _ => None,
-        }
-    }
-}
 
 /// Error condition observed by the interrupt handler, stored in [TransferContext::error].
 ///
@@ -87,14 +49,20 @@ enum TransferErrorKind {
 
 /// Transfer context structure.
 ///
-/// `transfer_type` doubles as the "transfer active" flag: it is always published last
-/// (`Release`) after the buffers and progress counters in [TransferState], and read first
-/// (`Acquire`) before them. A reader which observes an active transfer type is therefore
-/// guaranteed to see the matching buffers and counters, rather than stale ones from a previous
-/// transfer.
+/// `ops_slice_ptr` doubles as the "transfer active" flag. It is published last (`Release`)
+/// after the other fields and read first (`Acquire`) before them, so a reader which observes a
+/// non-null pointer also sees the matching length and progress counters.
 struct TransferContext {
-    transfer_type: AtomicU8,
-    state: TransferState,
+    /// Type and lifetime erased pointer to the operations slice.
+    ops_slice_ptr: AtomicPtr<()>,
+    /// Total number of operations.
+    ops_len: AtomicUsize,
+    /// Index of the operation currently being transferred.
+    ops_index: AtomicUsize,
+    /// Bytes of the current operation already moved to or from the FIFO.
+    op_progress: AtomicUsize,
+    done: AtomicBool,
+    waker: AtomicWaker,
     /// Set by the interrupt handler on an error condition, consumed by `take_error`.
     error: AtomicU8,
 }
@@ -102,10 +70,52 @@ struct TransferContext {
 impl TransferContext {
     const fn new() -> Self {
         Self {
-            transfer_type: AtomicU8::new(TransferType::NONE),
-            state: TransferState::new(),
+            ops_slice_ptr: AtomicPtr::new(core::ptr::null_mut()),
+            ops_len: AtomicUsize::new(0),
+            ops_index: AtomicUsize::new(0),
+            op_progress: AtomicUsize::new(0),
+            done: AtomicBool::new(false),
+            waker: AtomicWaker::new(),
             error: AtomicU8::new(TransferErrorKind::None as u8),
         }
+    }
+
+    /// Stores the operations and arms the gate, starting at operation `first`.
+    ///
+    /// # Safety
+    ///
+    /// `operations` must stay alive and must not be accessed otherwise until the context is
+    /// disarmed.
+    unsafe fn arm(&self, operations: &mut [Operation<'_>], first: usize, progress: usize) {
+        self.ops_len.store(operations.len(), Ordering::Relaxed);
+        self.ops_index.store(first, Ordering::Relaxed);
+        self.op_progress.store(progress, Ordering::Relaxed);
+        self.ops_slice_ptr
+            .store(operations.as_mut_ptr().cast(), Ordering::Release);
+    }
+
+    /// Returns the operations of the active transfer, or [None] if the gate is disarmed.
+    ///
+    /// # Safety
+    ///
+    /// Call at most once per interrupt handler call, and do not let the slice or anything
+    /// borrowed from it outlive that call.
+    unsafe fn operations<'a>(&self) -> Option<&'a mut [Operation<'a>]> {
+        let ptr = self
+            .ops_slice_ptr
+            .load(Ordering::Acquire)
+            .cast::<Operation<'a>>();
+        if ptr.is_null() {
+            return None;
+        }
+        Some(unsafe { core::slice::from_raw_parts_mut(ptr, self.ops_len.load(Ordering::Relaxed)) })
+    }
+
+    /// Disarms the gate, so a spurious interrupt can never observe the stale operations.
+    #[inline]
+    fn disarm(&self) {
+        self.ops_slice_ptr
+            .store(core::ptr::null_mut(), Ordering::Release);
     }
 
     /// Records an error condition, to be observed by `take_error`.
@@ -129,24 +139,18 @@ impl TransferContext {
         }
     }
 
-    /// Arms the gate. Must be called after all other fields were stored.
+    /// Marks the transfer as finished and wakes the registered waker.
     #[inline]
-    fn arm(&self, transfer_type: TransferType) {
-        self.transfer_type
-            .store(transfer_type as u8, Ordering::Release);
+    fn signal_done(&self) {
+        self.done.store(true, Ordering::Release);
+        self.waker.wake();
     }
 
-    /// Disarms the gate, so a spurious interrupt can never observe the stale buffer pointers.
+    /// Registers the waker and consumes the completion flag.
     #[inline]
-    fn disarm(&self) {
-        self.transfer_type
-            .store(TransferType::NONE, Ordering::Release);
-    }
-
-    /// Reads the gate. All other fields may only be read if this returns [Some].
-    #[inline]
-    fn active_transfer_type(&self) -> Option<TransferType> {
-        TransferType::from_raw(self.transfer_type.load(Ordering::Acquire))
+    fn poll_done(&self, waker: &core::task::Waker) -> bool {
+        self.waker.register(waker);
+        self.done.swap(false, Ordering::Acquire)
     }
 
     /// Closes the gate and restores the initial state, so the slot can be reused.
@@ -156,10 +160,119 @@ impl TransferContext {
         // cancellation path) must never see the fields below cleared while still
         // observing an armed transfer.
         self.disarm();
-        self.state.reset();
+        self.done.store(false, Ordering::Relaxed);
         self.error
             .store(TransferErrorKind::None as u8, Ordering::Relaxed);
     }
+}
+
+/// Moves bytes between the FIFO and `op`, starting at `progress`. Returns the new progress.
+fn pump_or_drain_fifo(
+    regs: &mut regs::MmioRegisters<'static>,
+    op: &mut Operation<'_>,
+    mut progress: usize,
+) -> usize {
+    match op {
+        Operation::Read(buf) => {
+            while progress < buf.len() && regs.read_status().rx_not_empty() {
+                buf[progress] = regs.read_data().data();
+                progress += 1;
+            }
+        }
+        Operation::Write(buf) => {
+            while progress < buf.len() && regs.read_status().tx_not_full() {
+                regs.write_data(regs::Data::new(buf[progress]));
+                progress += 1;
+            }
+        }
+    }
+    progress
+}
+
+/// Programs the word count and direction for the group starting at `first`, fills the TX FIFO
+/// for a write group and issues the command. Returns the interrupts the group needs, and the
+/// operation index and progress where the pre-fill stopped.
+///
+/// The caller enables the interrupts after the command was issued. Enabling `idle` before
+/// that would let the still idle bus trigger the completion path of a group which has not
+/// started yet.
+fn start_group(
+    regs: &mut regs::MmioRegisters<'static>,
+    ops: &mut [Operation<'_>],
+    first: usize,
+) -> (regs::InterruptControl, usize, usize) {
+    let dir = op_direction(&ops[first]);
+    let mut len = 0;
+    // Assume this is the last group until a direction change is found.
+    let mut command = super::Command::StartWithStop;
+    let mut i = Some(first);
+    while let Some(idx) = i {
+        if op_direction(&ops[idx]) != dir {
+            command = super::Command::Start;
+            break;
+        }
+        len += op_len(&ops[idx]);
+        i = next_op(ops, idx + 1);
+    }
+    // A zero-length write group is still sent. It addresses the target without data, which
+    // is a valid way to probe for a device.
+    regs.write_words(regs::Words::new(u11::new(len as u16)));
+    regs.modify_address(|val| val.with_direction(dir));
+    let receive = dir == regs::Direction::Receive;
+    let mut op_idx = first;
+    let mut progress = 0;
+    // The hardware sees the group as one byte stream, so the pre-fill can cross operation
+    // boundaries. It stops when the FIFO is full or the group ends.
+    if !receive {
+        loop {
+            progress = pump_or_drain_fifo(regs, &mut ops[op_idx], 0);
+            if progress < op_len(&ops[op_idx]) {
+                break;
+            }
+            match next_op(ops, op_idx + 1) {
+                Some(next) if op_direction(&ops[next]) == dir => op_idx = next,
+                _ => break,
+            }
+        }
+    }
+    regs.write_command(command.reg_value());
+
+    let interrupts = regs::InterruptControl::builder()
+        // Error conditions.
+        .with_clock_timeout(true)
+        .with_rx_overflow(receive)
+        .with_tx_overflow(!receive)
+        .with_arb_lost(true)
+        .with_nack_addr(true)
+        .with_nack_data(!receive)
+        // FIFO drain and re-fill conditions.
+        .with_rx_ready(receive && len > FIFO_DEPTH)
+        .with_tx_ready(!receive && len > FIFO_DEPTH)
+        // Done status. Groups followed by another one end in `waiting`, the last one in `idle`.
+        .with_idle(command == super::Command::StartWithStop)
+        .with_waiting(command == super::Command::Start)
+        // Users might be interested in getting informed about stall conditions.
+        .with_stalled(true)
+        // Unused.
+        .with_i2c_idle(false)
+        .with_tx_empty(false)
+        .with_rx_full(false)
+        .build();
+    (interrupts, op_idx, progress)
+}
+
+/// Cancels the transfer after an error and wakes the future.
+fn abort(
+    regs: &mut regs::MmioRegisters<'static>,
+    context: &TransferContext,
+    error: TransferErrorKind,
+) {
+    context.set_error(error);
+    regs.write_interrupt_enable(regs::InterruptControl::ZERO);
+    // Ends the transaction on the bus. Necessary because groups started with a plain `Start`
+    // do not self-terminate the way `StartWithStop` does.
+    regs.write_command(super::Command::Cancel.reg_value());
+    context.signal_done();
 }
 
 /// Async I2C driver, built on top of the blocking [I2cMaster](super::I2cMaster).
@@ -180,7 +293,13 @@ impl I2c {
     ) -> Self {
         i2c.regs
             .write_interrupt_enable(regs::InterruptControl::ZERO);
-        i2c.regs.write_interrupt_clear(InterruptClear::ALL);
+        i2c.regs.write_interrupt_clear(regs::InterruptClear::ALL);
+        // Half the FIFO depth for both directions leaves room for interrupt latency. A zero RX
+        // trigger level would keep `rx_ready` firing even with an empty FIFO.
+        i2c.regs
+            .write_rx_fifo_trigger(regs::TriggerLevel::new(u5::new(FIFO_DEPTH as u8 / 2)));
+        i2c.regs
+            .write_tx_fifo_trigger(regs::TriggerLevel::new(u5::new(FIFO_DEPTH as u8 / 2)));
         #[cfg(feature = "vor1x")]
         if let Some(irq_cfg) = opt_irq_cfg {
             if irq_cfg.route {
@@ -211,405 +330,194 @@ impl I2c {
     /// arbitration loss, NACKs and FIFO overflows as transfer errors. Other bits, like
     /// `stalled`, are not currently surfaced as an [super::Error] variant: read them from the
     /// returned value if you need to observe them.
-    pub fn on_interrupt(bank_id: super::Bank) -> regs::Status {
+    ///
+    /// # Safety
+    ///
+    /// Only call this from the interrupt handler of the given bank, and only once per handler
+    /// call. Concurrent calls for the same bank would access the transfer buffers at the same
+    /// time.
+    pub unsafe fn on_interrupt(bank_id: super::Bank) -> regs::Status {
         let mut regs = unsafe { bank_id.steal_regs() };
         let context = &TRANSFER_CONTEXTS[bank_id as usize];
 
-        // Use live status register.
         let interrupt_status = regs.read_interrupt_status();
-        // Clear all interrupts.
-        regs.write_interrupt_clear(InterruptClear::ALL);
+        regs.write_interrupt_clear(regs::InterruptClear::ALL);
         let status = regs.read_status();
 
-        let Some(transfer_type) = context.active_transfer_type() else {
+        // Safety: Only called once, and the slice does not leave this function.
+        let Some(operations) = (unsafe { context.operations() }) else {
             // Disable interrupts if there is no active transfer to avoid an interrupt loop.
-            regs.write_interrupt_enable(regs::InterruptControl::new_with_raw_value(0));
+            regs.write_interrupt_enable(regs::InterruptControl::ZERO);
             return status;
         };
+        let mut op_index = context.ops_index.load(Ordering::Relaxed);
+        let mut progress = context.op_progress.load(Ordering::Relaxed);
 
-        let mut common_error_handling = |error: TransferErrorKind| {
-            context.set_error(error);
-            regs.write_interrupt_enable(regs::InterruptControl::ZERO);
-            // Ends the transaction on the bus. Necessary because a `WriteRead`'s write phase
-            // uses a plain `Start`, which does not self-terminate the way `StartWithStop` does.
-            regs.write_command(
-                Command::builder()
-                    .with_start(false)
-                    .with_stop(false)
-                    .with_cancel(true)
-                    .build(),
-            );
-            context.state.signal_done();
-        };
         if interrupt_status.clock_timeout() {
-            common_error_handling(TransferErrorKind::ClockTimeout);
+            abort(&mut regs, context, TransferErrorKind::ClockTimeout);
             return status;
         }
         if status.arb_lost() {
-            common_error_handling(TransferErrorKind::ArbitrationLost);
+            abort(&mut regs, context, TransferErrorKind::ArbitrationLost);
             return status;
         }
         if status.nack_addr() {
-            common_error_handling(TransferErrorKind::NackAddr);
+            abort(&mut regs, context, TransferErrorKind::NackAddr);
             return status;
         }
-        // `nack_data` only indicates a real failure while transmitting: a slave NACKing a byte
-        // we wrote. On a receive, the *master* NACKs the last byte itself to end the transfer,
-        // which is normal termination, not a slave failure, but sets the same bit. The blocking
-        // driver makes the same distinction: `write_internal` checks this, `read_internal` does
-        // not.
-        let nack_data_is_error = match transfer_type {
-            TransferType::Read => false,
-            TransferType::Write => true,
-            // If `waiting` is observed on this same read, the write phase already succeeded (a
-            // real write NACK would have prevented it from ever firing) — even if this is the
-            // very first interrupt for the whole transfer, so `transfer_type` has not been
-            // updated to `WriteReadReceiving` yet. The write and read phases can complete close
-            // enough together that both show up in the same interrupt entry.
-            TransferType::WriteRead => !status.waiting(),
-            TransferType::WriteReadReceiving => false,
-        };
-        if nack_data_is_error && status.nack_data() {
-            common_error_handling(TransferErrorKind::NackData);
+        // On a receive, the master NACKs the last byte itself to end the transfer, which sets
+        // the same bit, so only writes are checked. On a write, the embedded-hal contract
+        // expects every byte to be acknowledged, including the last one.
+        if status.nack_data() && op_direction(&operations[op_index]) == regs::Direction::Send {
+            abort(&mut regs, context, TransferErrorKind::NackData);
             return status;
         }
+        // Normally the bus should stall before RX overflows and the logic should ensure a full
+        // FIFO is never written, but these checks are kept as a safety net.
         if interrupt_status.rx_overflow() || interrupt_status.tx_overflow() {
-            common_error_handling(TransferErrorKind::Overflow);
+            abort(&mut regs, context, TransferErrorKind::Overflow);
             return status;
         }
 
-        match transfer_type {
-            TransferType::Read | TransferType::WriteReadReceiving => {
-                Self::on_interrupt_receive(&mut regs, context);
+        loop {
+            // Sampled before moving bytes: once the controller is done, all received bytes are
+            // already in the FIFO.
+            let live_status = regs.read_status();
+            progress = pump_or_drain_fifo(&mut regs, &mut operations[op_index], progress);
+            let dir = op_direction(&operations[op_index]);
+            let opt_next_index = next_op(operations, op_index + 1);
+            let opt_next_group = next_group(operations, op_index);
+            // Only the last group ends in `idle`. The others end in `waiting`, which the last
+            // group never sets, even when the current operation is not the last one.
+            let group_done_condition = if opt_next_group.is_none() {
+                live_status.idle()
+            } else {
+                live_status.waiting()
+            };
+
+            // We moved bytes to or from the FIFO, and the hardware still needs to do work.
+            // So we break out of the loop.
+            if progress < op_len(&operations[op_index]) {
+                // Special case: We are done but did not receive all bytes for whatever reason.
+                if group_done_condition && dir == regs::Direction::Receive {
+                    abort(
+                        &mut regs,
+                        context,
+                        TransferErrorKind::InsufficientDataReceived,
+                    );
+                    return status;
+                }
+                break;
             }
-            TransferType::Write => {
-                Self::on_interrupt_write(&mut regs, context);
+            // Everything after here: progress is equal to operations length and we either have
+            // to wait for the done flag or start a new operation.
+
+            // Handling for consecutive operations. The continue advances to the next operation.
+            if let Some(next_index) = opt_next_index
+                && op_direction(&operations[next_index]) == dir
+            {
+                op_index = next_index;
+                progress = 0;
+                continue;
             }
-            TransferType::WriteRead => {
-                Self::on_interrupt_write_read(&mut regs, context, status);
+            // When we reach this point, all bytes of the group are in the FIFO. `tx_ready` is a
+            // level interrupt which stays set while the FIFO is below its trigger level, so it has
+            // to be disabled until the group is done.
+            regs.modify_interrupt_enable(|val| val.with_tx_ready(false));
+            // More work to do, so exit.
+            if !group_done_condition {
+                break;
             }
+            // At this point, we have to finish the last operation or start the next one.
+            match opt_next_group {
+                Some(next) => {
+                    let interrupts;
+                    (interrupts, op_index, progress) = start_group(&mut regs, operations, next);
+                    regs.write_interrupt_enable(interrupts);
+                }
+                None => {
+                    regs.write_interrupt_enable(regs::InterruptControl::ZERO);
+                    context.signal_done();
+                }
+            }
+            // The group is finished, so leave. Only the `continue` above repeats the loop. The
+            // next interrupt picks up the new group, because the status sampled here can still
+            // show the end of the previous one.
+            break;
         }
+        context.ops_index.store(op_index, Ordering::Relaxed);
+        context.op_progress.store(progress, Ordering::Relaxed);
         status
     }
 
-    /// Handles the receive phase of [TransferType::Read] and [TransferType::WriteReadReceiving].
-    fn on_interrupt_receive(regs: &mut regs::MmioRegisters<'static>, context: &TransferContext) {
-        // Sampled before draining: once the controller is idle, every received byte is already
-        // in the FIFO. Sampling it afterwards could see a byte arrive between the drain and the
-        // check and count it as missing. If the transfer goes idle during the drain, the latched
-        // idle interrupt fires again.
-        let idle = regs.read_status().idle();
-        let mut progress = context.state.rx_progress.load(Ordering::Relaxed);
-        let slice = unsafe { context.state.rx_slice() };
-        while regs.read_status().rx_not_empty() && progress < slice.len() {
-            slice[progress] = regs.read_data().data();
-            progress += 1;
-        }
-        context.state.rx_progress.store(progress, Ordering::Relaxed);
-        if idle {
-            if progress < slice.len() {
-                context.set_error(TransferErrorKind::InsufficientDataReceived);
-            }
-            context.state.signal_done();
-            regs.write_interrupt_enable(regs::InterruptControl::ZERO);
-        }
-    }
-
-    fn on_interrupt_write(regs: &mut regs::MmioRegisters<'static>, context: &TransferContext) {
-        let mut progress = context.state.tx_progress.load(Ordering::Relaxed);
-        let slice = unsafe { context.state.tx_slice() };
-        if progress >= slice.len() {
-            context.state.signal_done();
-            regs.write_interrupt_enable(regs::InterruptControl::ZERO);
-            return;
-        }
-        while regs.read_status().tx_not_full() && progress < slice.len() {
-            regs.write_data(Data::new(slice[progress]));
-            progress += 1;
-        }
-        context.state.tx_progress.store(progress, Ordering::Relaxed);
-    }
-
-    fn on_interrupt_write_read(
-        regs: &mut regs::MmioRegisters<'static>,
-        context: &TransferContext,
-        status: regs::Status,
-    ) {
-        // Still in the write phase.
-        let mut tx_progress = context.state.tx_progress.load(Ordering::Relaxed);
-        let tx_slice = unsafe { context.state.tx_slice() };
-        while regs.read_status().tx_not_full() && tx_progress < tx_slice.len() {
-            regs.write_data(Data::new(tx_slice[tx_progress]));
-            tx_progress += 1;
-        }
-        context
-            .state
-            .tx_progress
-            .store(tx_progress, Ordering::Relaxed);
-
-        if status.waiting() {
-            // Write phase finished, so we need to set up the reception transfer.
-            // `waiting` is not clearable and stays set for the rest of the transfer, so
-            // transitioning to `WriteReadReceiving` here is what stops this from
-            // re-issuing the read phase's `Start`/`Stop` on every later interrupt.
-            let rx_slice = unsafe { context.state.rx_slice() };
-            regs.write_words(regs::Words::new(u11::new(rx_slice.len() as u16)));
-            regs.modify_address(|val| val.with_direction(regs::Direction::Receive));
-            regs.write_command(
-                Command::builder()
-                    .with_start(true)
-                    .with_stop(true)
-                    .with_cancel(false)
-                    .build(),
-            );
-            // The read phase completes on idle, which the controller only reaches after the
-            // STOP. The master NACK on the last byte comes before that, so it cannot be relied on
-            // to observe idle.
-            regs.modify_interrupt_enable(|value| value.with_idle(true));
-            context.arm(TransferType::WriteReadReceiving);
-        }
-    }
-
-    /// Start an async read transaction, returning a future which completes once `buf` was
-    /// filled.
-    pub fn read(&mut self, address: u8, buf: &mut [u8]) -> Result<Transfer<'_>, super::Error> {
-        let len = buf.len();
-        if len > 0x7fe {
-            return Err(super::Error::DataTooLarge);
-        }
-        let bank = self.0.id;
-        self.0.clear_rx_fifo();
-        // Load number of words
-        self.0
-            .regs
-            .write_words(regs::Words::new(u11::new(len as u16)));
-
-        let context = &TRANSFER_CONTEXTS[bank as usize];
-        // Safety contract is documented in top-level driver: Users are not alllowed to forget
-        // I2C transfers.
-        unsafe {
-            context.state.set_rx_slice(buf);
-        }
-        context.arm(TransferType::Read);
-
-        self.0.regs.write_interrupt_clear(InterruptClear::ALL);
-        // Only issue the address and command after arming the gate but before enabling
-        // interrupts: enabling `idle`/`waiting` beforehand would let a spurious interrupt for
-        // the still-genuinely-idle bus fall into the armed match arm below, find nothing to do,
-        // and never disable interrupts again, since nothing about the real transaction has
-        // started yet to ever make the completion condition true.
-        self.0
-            .write_address_and_direction(Address::Regular(address), regs::Direction::Receive);
-        self.0.write_command(super::Command::StartWithStop);
-
-        self.0.regs.write_interrupt_enable(
-            regs::InterruptControl::builder()
-                // Error conditions.
-                .with_clock_timeout(true)
-                .with_rx_overflow(true)
-                .with_tx_overflow(false)
-                .with_arb_lost(true)
-                .with_nack_addr(true)
-                .with_nack_data(true)
-                // FIFO drain condition.
-                .with_rx_ready(len > FIFO_DEPTH)
-                .with_tx_ready(false)
-                // Done status.
-                .with_idle(true)
-                // Explicitely set to false, only required for write-read transactions.
-                .with_waiting(false)
-                // Users might be interested in getting informed about stall conditions.
-                .with_stalled(true)
-                // Unused.
-                .with_i2c_idle(false)
-                .with_tx_empty(false)
-                .with_rx_full(false)
-                .build(),
-        );
-
-        Ok(Transfer {
-            driver: self,
-            finished_regularly: core::cell::Cell::new(false),
-        })
-    }
-
-    /// Start an async write transaction, returning a future which completes once `data` was
-    /// sent.
-    pub fn write(&mut self, address: u8, data: &[u8]) -> Result<Transfer<'_>, super::Error> {
-        let len = data.len();
-        if len > 0x7fe {
-            return Err(super::Error::DataTooLarge);
-        }
-        let bank = self.0.id;
+    /// Start an async transaction, returning a future which completes once all operations
+    /// were performed.
+    ///
+    /// Consecutive operations of the same direction are merged into one hardware transfer.
+    /// Empty reads are skipped. Empty writes address the target without data, which can be used
+    /// to probe for a device.
+    pub fn transaction<'ops>(
+        &mut self,
+        address: u8,
+        operations: &'ops mut [Operation<'_>],
+    ) -> Result<Transfer<'_, 'ops>, super::Error> {
+        check_group_lengths(operations)?;
+        let context = &TRANSFER_CONTEXTS[self.0.id as usize];
+        let Some(first) = next_op(operations, 0) else {
+            context.signal_done();
+            return Ok(Transfer::new(self));
+        };
+        self.0.disable_interrupts();
+        self.0.regs.write_interrupt_clear(regs::InterruptClear::ALL);
         self.0.clear_tx_fifo();
-        // Load number of words
-        self.0
-            .regs
-            .write_words(regs::Words::new(u11::new(len as u16)));
-        let current_index = core::cmp::min(FIFO_DEPTH, len);
-        let mut bytes = data.iter();
-        // load the FIFO
-        for _ in 0..current_index {
-            self.0.write_fifo_unchecked(*bytes.next().unwrap());
-        }
+        self.0.clear_rx_fifo();
 
-        let context = &TRANSFER_CONTEXTS[bank as usize];
-        // Safety contract is documented in top-level driver: Users are not alllowed to forget
-        // I2C transfers.
-        unsafe {
-            context.state.set_tx_slice(data);
-        }
-        context
-            .state
-            .tx_progress
-            .store(current_index, Ordering::Relaxed);
-        context.arm(TransferType::Write);
-
-        self.0.regs.write_interrupt_clear(InterruptClear::ALL);
-        // See the comment in `read` on why the address/command must be issued before
-        // interrupts are enabled.
-        self.0
-            .write_address_and_direction(Address::Regular(address), regs::Direction::Send);
-        self.0.write_command(super::Command::StartWithStop);
-
-        self.0.regs.write_interrupt_enable(
-            regs::InterruptControl::builder()
-                // Error conditions.
-                .with_clock_timeout(true)
-                .with_tx_overflow(true)
-                .with_rx_overflow(false)
-                .with_arb_lost(true)
-                .with_nack_addr(true)
-                .with_nack_data(true)
-                // FIFO re-fill condition.
-                .with_tx_ready(len > FIFO_DEPTH)
-                .with_rx_ready(false)
-                // Done status.
-                .with_idle(true)
-                // Explicitely set to false, only required for write-read transactions.
-                .with_waiting(false)
-                // Users might be interested in getting informed about stall conditions.
-                .with_stalled(true)
-                // Unused.
-                .with_i2c_idle(false)
-                .with_tx_empty(false)
-                .with_rx_full(false)
-                .build(),
+        self.0.write_address_and_direction(
+            Address::Regular(address),
+            op_direction(&operations[first]),
         );
+        let (interrupts, op_index, progress) = start_group(&mut self.0.regs, operations, first);
+        // Safety: The returned transfer borrows `operations` until it completes or is dropped.
+        // Users are not allowed to forget transfers, see the safety note on [Self::new].
+        unsafe { context.arm(operations, op_index, progress) };
+        self.0.regs.write_interrupt_enable(interrupts);
 
-        Ok(Transfer {
-            driver: self,
-            finished_regularly: core::cell::Cell::new(false),
-        })
+        Ok(Transfer::new(self))
+    }
+}
+
+/// Inherent versions of the [embedded_hal_async::i2c::I2c] methods, so they can be used without
+/// importing the trait.
+impl I2c {
+    /// Async read transaction.
+    pub async fn read(&mut self, address: u8, buf: &mut [u8]) -> Result<(), super::Error> {
+        embedded_hal_async::i2c::I2c::read(self, address, buf).await
     }
 
-    /// Start an async write-then-read transaction, returning a future which completes once
-    /// `write` was sent and `read` was filled.
-    pub fn write_read(
+    /// Async write transaction.
+    pub async fn write(&mut self, address: u8, data: &[u8]) -> Result<(), super::Error> {
+        embedded_hal_async::i2c::I2c::write(self, address, data).await
+    }
+
+    /// Async write-read transaction.
+    pub async fn write_read(
         &mut self,
         address: u8,
         write: &[u8],
         read: &mut [u8],
-    ) -> Result<Transfer<'_>, super::Error> {
-        if write.len() > 0x7fe || read.len() > 0x7fe {
-            return Err(super::Error::DataTooLarge);
-        }
-        let bank = self.0.id;
-        self.0.clear_rx_fifo();
-        self.0.clear_tx_fifo();
-        let write_len = write.len();
-        // Load number of words
-        self.0
-            .regs
-            .write_words(regs::Words::new(u11::new(write_len as u16)));
-        let mut bytes = write.iter();
-        let current_index = core::cmp::min(FIFO_DEPTH, write.len());
-        // load the FIFO
-        for _ in 0..current_index {
-            self.0.write_fifo_unchecked(*bytes.next().unwrap());
-        }
-
-        let context = &TRANSFER_CONTEXTS[bank as usize];
-        // Safety contract is documented in top-level driver: Users are not alllowed to forget
-        // I2C transfers.
-        unsafe {
-            context.state.set_tx_slice(write);
-            context.state.set_rx_slice(read);
-        }
-        context
-            .state
-            .tx_progress
-            .store(current_index, Ordering::Relaxed);
-        context.arm(TransferType::WriteRead);
-
-        self.0.regs.write_interrupt_clear(InterruptClear::ALL);
-        // See the comment in `read` on why the address/command must be issued before
-        // interrupts are enabled.
-        self.0
-            .write_address_and_direction(Address::Regular(address), regs::Direction::Send);
-        self.0.write_command(super::Command::Start);
-
-        self.0.regs.write_interrupt_enable(
-            regs::InterruptControl::builder()
-                // Error conditions.
-                .with_clock_timeout(true)
-                .with_rx_overflow(true)
-                .with_tx_overflow(true)
-                .with_arb_lost(true)
-                .with_nack_addr(true)
-                .with_nack_data(true)
-                // FIFO drain condition.
-                .with_rx_ready(read.len() > FIFO_DEPTH)
-                .with_tx_ready(write_len > FIFO_DEPTH)
-                // Done status. Enabled by the interrupt handler once the read phase starts,
-                // `waiting` signals the end of the write phase.
-                .with_idle(false)
-                // Will be set when the write part is finished.
-                .with_waiting(true)
-                // Users might be interested in getting informed about stall conditions.
-                .with_stalled(true)
-                // Unused.
-                .with_i2c_idle(false)
-                .with_tx_empty(false)
-                .with_rx_full(false)
-                .build(),
-        );
-
-        Ok(Transfer {
-            driver: self,
-            finished_regularly: core::cell::Cell::new(false),
-        })
+    ) -> Result<(), super::Error> {
+        embedded_hal_async::i2c::I2c::write_read(self, address, write, read).await
     }
 }
 
 impl embedded_hal_async::i2c::I2c for I2c {
+    #[inline]
     async fn transaction(
         &mut self,
         address: u8,
-        operations: &mut [embedded_hal::i2c::Operation<'_>],
+        operations: &mut [Operation<'_>],
     ) -> Result<(), Self::Error> {
-        for operation in operations {
-            match operation {
-                embedded_hal::i2c::Operation::Read(buf) => {
-                    self.read(address, buf)?.await?;
-                }
-                embedded_hal::i2c::Operation::Write(buf) => {
-                    self.write(address, buf)?.await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[inline]
-    async fn write_read(
-        &mut self,
-        address: u8,
-        write: &[u8],
-        read: &mut [u8],
-    ) -> Result<(), Self::Error> {
-        self.write_read(address, write, read)?.await?;
-        Ok(())
+        self.transaction(address, operations)?.await
     }
 }
 
@@ -617,15 +525,27 @@ impl embedded_hal_async::i2c::ErrorType for I2c {
     type Error = super::Error;
 }
 
-/// Live I2C transfer returned by the async transfer methods on [I2c].
+/// Live I2C transfer returned by [I2c::transaction].
 ///
 /// Implements [Future] and can be polled/awaited to completion.
-pub struct Transfer<'a> {
-    driver: &'a mut I2c,
+pub struct Transfer<'d, 'ops> {
+    driver: &'d mut I2c,
     finished_regularly: Cell<bool>,
+    /// The interrupt handler accesses the operations until the transfer completes or is dropped.
+    _operations: PhantomData<&'ops mut ()>,
 }
 
-impl core::future::Future for Transfer<'_> {
+impl<'d> Transfer<'d, '_> {
+    fn new(driver: &'d mut I2c) -> Self {
+        Self {
+            driver,
+            finished_regularly: Cell::new(false),
+            _operations: PhantomData,
+        }
+    }
+}
+
+impl core::future::Future for Transfer<'_, '_> {
     type Output = Result<(), super::Error>;
 
     fn poll(
@@ -633,43 +553,44 @@ impl core::future::Future for Transfer<'_> {
         cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<Self::Output> {
         let context = &TRANSFER_CONTEXTS[self.driver.0.id() as usize];
-        if context.state.poll_done(cx.waker()) {
-            self.finished_regularly.set(true);
-            // Read the error before resetting: `reset` clears it too, so it must happen last.
-            let error = context.take_error();
-            context.reset();
-            if let Some(error) = error {
-                let transfer_error = match error {
-                    TransferErrorKind::ArbitrationLost => super::Error::ArbitrationLost,
-                    TransferErrorKind::NackAddr => super::Error::NackAddr,
-                    TransferErrorKind::NackData => super::Error::NackData,
-                    TransferErrorKind::ClockTimeout => super::Error::ClockTimeout(
-                        self.driver.0.regs.read_clk_timeout_limit().value(),
-                    ),
-                    TransferErrorKind::Overflow => super::Error::Overflow,
-                    TransferErrorKind::InsufficientDataReceived => {
-                        super::Error::InsufficientDataReceived
-                    }
-                    _ => return core::task::Poll::Ready(Ok(())),
-                };
-                return core::task::Poll::Ready(Err(transfer_error));
-            }
-            return core::task::Poll::Ready(Ok(()));
+        if !context.poll_done(cx.waker()) {
+            return core::task::Poll::Pending;
         }
-        core::task::Poll::Pending
+        self.finished_regularly.set(true);
+        // Read the error before resetting: `reset` clears it too, so it must happen last.
+        let error = context.take_error();
+        context.reset();
+        let Some(error) = error else {
+            return core::task::Poll::Ready(Ok(()));
+        };
+        let transfer_error = match error {
+            TransferErrorKind::None => return core::task::Poll::Ready(Ok(())),
+            TransferErrorKind::ArbitrationLost => super::Error::ArbitrationLost,
+            TransferErrorKind::NackAddr => super::Error::NackAddr,
+            TransferErrorKind::NackData => super::Error::NackData,
+            TransferErrorKind::ClockTimeout => {
+                super::Error::ClockTimeout(self.driver.0.regs.read_clk_timeout_limit().value())
+            }
+            TransferErrorKind::Overflow => super::Error::Overflow,
+            TransferErrorKind::InsufficientDataReceived => super::Error::InsufficientDataReceived,
+        };
+        core::task::Poll::Ready(Err(transfer_error))
     }
 }
 
-impl Drop for Transfer<'_> {
+impl Drop for Transfer<'_, '_> {
     fn drop(&mut self) {
         if !self.finished_regularly.get() {
-            self.driver.0.disable_interrupts();
+            // Disarm before disabling the interrupts. An interrupt already pending in the NVIC
+            // would otherwise still see the armed transfer, start the next group and re-enable
+            // the interrupts.
             let context = &TRANSFER_CONTEXTS[self.driver.0.id() as usize];
             context.reset();
+            self.driver.0.disable_interrupts();
             self.driver
                 .0
                 .regs
-                .write_interrupt_clear(InterruptClear::ALL);
+                .write_interrupt_clear(regs::InterruptClear::ALL);
             self.driver.0.cancel_transfer();
             self.driver.0.clear_tx_fifo();
             self.driver.0.clear_rx_fifo();

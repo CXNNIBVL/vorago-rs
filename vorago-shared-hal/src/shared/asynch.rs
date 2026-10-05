@@ -3,15 +3,13 @@ use core::sync::atomic::Ordering;
 use embassy_sync::waitqueue::AtomicWaker;
 use portable_atomic::{AtomicBool, AtomicPtr, AtomicUsize};
 
-/// Shared buffer-tracking and completion-signaling state for an async transfer, reused by the
-/// SPI and I2C drivers.
+/// Buffer-tracking and completion-signaling state for an async transfer, used by the SPI driver.
 ///
 /// Plain atomics rather than a `critical_section::Mutex<RefCell<_>>` so it can live in a
 /// `static` array directly and the interrupt handler does not need a critical section.
 ///
-/// This does not include the transfer-type gate itself: each driver keeps that as its own
-/// `AtomicU8` field alongside a `TransferState`, since the set of transfer kinds differs per
-/// driver.
+/// This does not include the transfer-type gate itself: the driver keeps that as its own
+/// `AtomicU8` field alongside a `TransferState`.
 pub(crate) struct TransferState {
     /// Progress counter for the TX side of the transfer, in words.
     pub(crate) tx_progress: AtomicUsize,
