@@ -284,6 +284,13 @@ pub mod types {
     #[cfg_attr(feature = "defmt", derive(defmt::Format))]
     pub struct DataCount(arbitrary_int::UInt<u32, 11>);
 
+    impl DataCount {
+        /// The raw word count value.
+        pub const fn value(&self) -> u11 {
+            u11::new(self.0.value() as u16)
+        }
+    }
+
     /// IRQENB register.
     #[bitbybit::bitfield(u32, default = 0x0, debug, defmt_bitfields(feature = "defmt"))]
     pub struct InterruptControl {
@@ -317,7 +324,7 @@ pub mod types {
         /// RX overflow interrupt enable.
         #[bit(11, rw)]
         rx_overflow: bool,
-        /// TX ready interrupt enable.
+        /// TX ready interrupt enable. TX is ready when the FIFO level is below the threshold.
         #[bit(12, rw)]
         tx_ready: bool,
         /// RX ready interrupt enable.

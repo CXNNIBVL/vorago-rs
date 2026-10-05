@@ -19,7 +19,7 @@ use va108xx as pac;
 use va416xx as pac;
 
 //==================================================================================================
-// Defintions
+// Definitions
 //==================================================================================================
 
 /// Standard mode bus frequency.
@@ -109,13 +109,25 @@ impl embedded_hal::i2c::Error for Error {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Command {
     /// Issue a START condition.
-    Start = 0b01,
+    Start,
     /// Issue a STOP condition.
-    Stop = 0b10,
+    Stop,
     /// Issue a START condition followed by a STOP condition.
-    StartWithStop = 0b11,
+    StartWithStop,
     /// Cancel the current transaction.
-    Cancel = 0b100,
+    Cancel,
+}
+
+impl Command {
+    /// COMMAND register value for this command.
+    pub const fn reg_value(&self) -> regs::Command {
+        match self {
+            Command::Start => regs::Command::ZERO.with_start(true),
+            Command::Stop => regs::Command::ZERO.with_stop(true),
+            Command::StartWithStop => regs::Command::ZERO.with_start(true).with_stop(true),
+            Command::Cancel => regs::Command::ZERO.with_cancel(true),
+        }
+    }
 }
 
 /// Slave address, either 7-bit or 10-bit.
@@ -159,7 +171,7 @@ impl From<TenBitAddress> for Address {
 }
 
 /// Common trait implemented by all PAC peripheral access structures. The register block
-/// format is the same for all SPI blocks.
+/// format is the same for all I2C blocks.
 pub trait I2cInstance: Sealed {
     /// I2C bank of the peripheral.
     const ID: Bank;
@@ -246,7 +258,7 @@ pub struct TimingConfig {
     pub t_buf: u4,
 }
 
-/// Default configuration are the register reset value which are used by default.
+/// The default configuration uses the register reset values.
 impl Default for TimingConfig {
     fn default() -> Self {
         TimingConfig {
@@ -472,13 +484,7 @@ impl<Addr> I2cMaster<Addr> {
     /// Cancel the currently ongoing transaction.
     #[inline]
     pub fn cancel_transfer(&mut self) {
-        self.regs.write_command(
-            regs::Command::builder()
-                .with_start(false)
-                .with_stop(false)
-                .with_cancel(true)
-                .build(),
-        );
+        self.write_command(Command::Cancel);
     }
 
     /// Disable the interrupts.
@@ -566,8 +572,7 @@ impl<Addr> I2cMaster<Addr> {
     /// Write a command to the COMMAND register.
     #[inline]
     pub fn write_command(&mut self, cmd: Command) {
-        self.regs
-            .write_command(regs::Command::new_with_raw_value(cmd as u32));
+        self.regs.write_command(cmd.reg_value());
     }
 
     /// Write the target address and transfer direction to the ADDRESS register.
@@ -645,10 +650,7 @@ impl<Addr> I2cMaster<Addr> {
             let first_op_in_group = prev_dir != Some(dir);
             // Only used for the first operation of a group. The look ahead below adds the lengths
             // of the other operations in the group.
-            let mut group_len = match &operations[i] {
-                Operation::Read(items) => items.len(),
-                Operation::Write(items) => items.len(),
-            };
+            let mut group_len = op_len(&operations[i]);
             let more_ops_in_group = next_dir == Some(dir);
 
             if first_op_in_group {
@@ -660,10 +662,7 @@ impl<Addr> I2cMaster<Addr> {
                         break;
                     }
 
-                    match next_op {
-                        Operation::Read(items) => group_len += items.len(),
-                        Operation::Write(items) => group_len += items.len(),
-                    }
+                    group_len += op_len(next_op);
                 }
                 // A zero-length write group is still sent. It addresses the target without data,
                 // which is a valid way to probe for a device.
@@ -815,8 +814,28 @@ fn op_direction(op: &Operation<'_>) -> regs::Direction {
         Operation::Write(_) => regs::Direction::Send,
     }
 }
+
+fn op_len(op: &Operation<'_>) -> usize {
+    match op {
+        Operation::Read(items) => items.len(),
+        Operation::Write(items) => items.len(),
+    }
+}
+
 fn is_empty_read(op: &Operation<'_>) -> bool {
     matches!(op, Operation::Read(buf) if buf.is_empty())
+}
+
+/// Index of the next operation at or after `from`, skipping empty reads.
+fn next_op(ops: &[Operation<'_>], from: usize) -> Option<usize> {
+    (from..ops.len()).find(|&i| !is_empty_read(&ops[i]))
+}
+
+/// Index of the first operation of the group after the one containing `idx`, skipping empty
+/// reads.
+fn next_group(ops: &[Operation<'_>], idx: usize) -> Option<usize> {
+    let dir = op_direction(&ops[idx]);
+    (idx + 1..ops.len()).find(|&i| !is_empty_read(&ops[i]) && op_direction(&ops[i]) != dir)
 }
 
 fn check_group_lengths(operations: &[Operation<'_>]) -> Result<(), Error> {
@@ -827,10 +846,7 @@ fn check_group_lengths(operations: &[Operation<'_>]) -> Result<(), Error> {
         if prev_dir != Some(dir) {
             group_len = 0;
         }
-        group_len += match op {
-            Operation::Read(items) => items.len(),
-            Operation::Write(items) => items.len(),
-        };
+        group_len += op_len(op);
         if group_len > MAX_WORD_COUNT {
             return Err(Error::DataTooLarge);
         }
