@@ -46,8 +46,39 @@ impl AlarmState {
 unsafe impl Send for AlarmState {}
 
 static SCALE: OnceCell<u64> = OnceCell::new();
+/// Timekeeper geometry, see [`TimekeeperPeriod`].
+static PERIOD: OnceCell<TimekeeperPeriod> = OnceCell::new();
 static TIMEKEEPER_TIM: OnceCell<TimId> = OnceCell::new();
 static ALARM_TIM: OnceCell<TimId> = OnceCell::new();
+
+/// One timekeeper period is a whole number of embassy ticks, so [`TimerDriver::now`] needs no
+/// 64-bit division. A 64-bit division is slow in software on Cortex-M0, and with a period of
+/// exactly 2^32 timer ticks its fast path ends after the first counter overflow.
+struct TimekeeperPeriod {
+    /// Timer ticks per embassy tick.
+    scale: u32,
+    /// Embassy ticks per period.
+    ticks: u32,
+    /// Counter reset value. A period has `reset_value + 1` timer ticks.
+    reset_value: u32,
+}
+
+impl TimekeeperPeriod {
+    fn new(timer_clock_hz: u32) -> Self {
+        let scale = timer_clock_hz / TICK_HZ as u32;
+        let ticks = u32::MAX / scale;
+        Self {
+            scale,
+            ticks,
+            reset_value: ticks * scale - 1,
+        }
+    }
+
+    /// Embassy ticks at the start of `period`.
+    fn start(&self, period: u32) -> u64 {
+        period as u64 * self.ticks as u64
+    }
+}
 
 /// Embassy time driver, implemented on top of two hardware timers.
 pub struct TimerDriver {
@@ -83,9 +114,11 @@ impl TimerDriver {
         SCALE
             .set((sysclk.to_raw() / TICK_HZ as u32) as u64)
             .unwrap();
-        timekeeper_reg_block.write_reset_value(u32::MAX);
+        let period = TimekeeperPeriod::new(sysclk.to_raw());
+        timekeeper_reg_block.write_reset_value(period.reset_value);
         // Decrementing counter.
-        timekeeper_reg_block.write_count_value(u32::MAX);
+        timekeeper_reg_block.write_count_value(period.reset_value);
+        PERIOD.set(period).ok();
         let irqsel = unsafe { va108xx::Irqsel::steal() };
         // Switch on. Timekeeping should always be done.
         irqsel
@@ -142,9 +175,11 @@ impl TimerDriver {
         SCALE
             .set((TimekeeperTim::clock(clocks).to_raw() / TICK_HZ as u32) as u64)
             .unwrap();
-        timekeeper_regs.write_reset_value(u32::MAX);
+        let period = TimekeeperPeriod::new(TimekeeperTim::clock(clocks).to_raw());
+        timekeeper_regs.write_reset_value(period.reset_value);
         // Decrementing counter.
-        timekeeper_regs.write_count_value(u32::MAX);
+        timekeeper_regs.write_count_value(period.reset_value);
+        PERIOD.set(period).ok();
         // Switch on. Timekeeping should always be done.
         unsafe {
             enable_nvic_interrupt(TimekeeperTim::IRQ);
@@ -206,7 +241,7 @@ impl TimerDriver {
 
     fn next_period(&self) {
         let period = self.periods.fetch_add(1, Ordering::AcqRel) + 1;
-        let t = (period as u64) << 32;
+        let t = PERIOD.get().unwrap().start(period);
         critical_section::with(|cs| {
             let alarm = &self.alarms.borrow(cs);
             let at = alarm.timestamp.get();
@@ -305,9 +340,9 @@ impl TimerDriver {
 
 impl Driver for TimerDriver {
     fn now(&self) -> u64 {
-        if SCALE.get().is_none() {
+        let Some(period) = PERIOD.get() else {
             return 0;
-        }
+        };
         let mut period1: u32;
         let mut period2: u32;
         let mut counter_val: u32;
@@ -317,13 +352,12 @@ impl Driver for TimerDriver {
             // no instructions can be reordered before the load.
             period1 = self.periods.load(Ordering::Acquire);
 
-            counter_val = u32::MAX - Self::timekeeper_tim().read_count_value();
+            counter_val = period.reset_value - Self::timekeeper_tim().read_count_value();
 
             // Double read to protect against race conditions when the counter is overflowing.
             period2 = self.periods.load(Ordering::Relaxed);
             if period1 == period2 {
-                let now = (((period1 as u64) << 32) | counter_val as u64) / *SCALE.get().unwrap();
-                return now;
+                return period.start(period1) + (counter_val / period.scale) as u64;
             }
         }
     }
