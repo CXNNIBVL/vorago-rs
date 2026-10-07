@@ -27,6 +27,12 @@
 //! application code. If this is done, [init_with_custom_irqs] must be used
 //! method to pass the IRQ numbers to the library.
 //!
+//! ## Tick rate
+//!
+//! `sysclk` should be a multiple of the embassy `TICK_HZ`. Otherwise, embassy time advances
+//! slightly faster than real time. For example, a 50 MHz `sysclk` with `tick-hz-32_768` is about
+//! 0.06 % faster.
+//!
 //! ## Examples
 //!
 //! [embassy example projects](https://github.com/ustgt-irs/vorago-rs/tree/main/va108xx/examples/embassy)
@@ -85,6 +91,10 @@ embassy_time_driver_irqs!(timekeeper_irq = OC29, alarm_irq = OC28);
 ///
 /// This should be used if the interrupt handler is provided by the library, which is the
 /// default case.
+///
+/// # Panics
+///
+/// Panics if the embassy `TICK_HZ` is higher than `sysclk`.
 #[cfg(feature = "_irqs-in-lib")]
 pub fn init<TimekeeperTim: TimInstance, AlarmTim: TimInstance>(
     timekeeper_tim: TimekeeperTim,
@@ -97,6 +107,10 @@ pub fn init<TimekeeperTim: TimInstance, AlarmTim: TimInstance>(
 /// Initialization method for embassy when using custom IRQ handlers.
 ///
 /// Requires an explicit [pac::Interrupt] argument for the timekeeper and alarm IRQs.
+///
+/// # Panics
+///
+/// Panics if the embassy `TICK_HZ` is higher than `sysclk`.
 pub fn init_with_custom_irqs<TimekeeperTim: TimInstance, AlarmTim: TimInstance>(
     timekeeper_tim: TimekeeperTim,
     alarm_tim: AlarmTim,
