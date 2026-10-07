@@ -25,6 +25,12 @@
 //! documented combination of IRQs. It is also possible to specify custom IRQs by importing and
 //! using the [crate::embassy_time_driver_irqs] macro to declare the IRQ handlers in the
 //! application code.
+//!
+//! ## Tick rate
+//!
+//! The timer clock should be a multiple of the embassy `TICK_HZ`. Otherwise, embassy time advances
+//! slightly faster than real time. For example, a 50 MHz timer clock with `tick-hz-32_768` is
+//! about 0.06 % faster.
 #[cfg(feature = "_irqs-in-lib")]
 use crate::pac::{self, interrupt};
 #[cfg(feature = "_irqs-in-lib")]
@@ -82,6 +88,10 @@ embassy_time_driver_irqs!(timekeeper_irq = TIM23, alarm_irq = TIM22);
 /// used TIM peripherals has to match the ID of the passed timer peripherals. Currently, this
 /// can only be checked at run-time, and a run-time assertion will panic on the embassy
 /// initialization in case of a missmatch.
+///
+/// # Panics
+///
+/// Panics if the embassy `TICK_HZ` is higher than the timer clock.
 pub fn init<TimekeeperTim: TimInstance, AlarmTim: TimInstance>(
     timekeeper: TimekeeperTim,
     alarm: AlarmTim,

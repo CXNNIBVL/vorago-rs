@@ -19,6 +19,11 @@ use crate::time::Hertz;
 #[cfg(feature = "vor1x")]
 use crate::{PeripheralSelect, enable_peripheral_clock};
 
+/// Timekeeper configuration which remains fixed after initialization, see [`TimekeeperConfig`].
+static TIMEKEEPER_CONFIG: OnceCell<TimekeeperConfig> = OnceCell::new();
+static TIMEKEEPER_TIM: OnceCell<TimId> = OnceCell::new();
+static ALARM_TIM: OnceCell<TimId> = OnceCell::new();
+
 time_driver_impl!(
     static TIME_DRIVER: TimerDriver = TimerDriver {
         periods: AtomicU32::new(0),
@@ -54,41 +59,42 @@ const TICK_HZ_U32: u32 = {
     TICK_HZ as u32
 };
 
-static SCALE: OnceCell<u64> = OnceCell::new();
-/// Timekeeper geometry, see [`TimekeeperPeriod`].
-static PERIOD: OnceCell<TimekeeperPeriod> = OnceCell::new();
-static TIMEKEEPER_TIM: OnceCell<TimId> = OnceCell::new();
-static ALARM_TIM: OnceCell<TimId> = OnceCell::new();
-
 /// One timekeeper period is a whole number of embassy ticks, so [`TimerDriver::now`] needs no
-/// 64-bit division. A 64-bit division is slow in software on Cortex-M0, and with a period of
-/// exactly 2^32 timer ticks its fast path ends after the first counter overflow.
-struct TimekeeperPeriod {
+/// 64-bit division.
+///
+/// A 64-bit division is slow in software on Cortex-M0, and with a period of
+/// exactly 2^32 ticks, the fast path ends after the first counter overflow.
+struct TimekeeperConfig {
     /// Timer ticks per embassy tick.
-    scale: u32,
-    /// Embassy ticks per period.
-    ticks: u32,
+    timer_ticks_per_embassy_tick: u32,
+    /// Embassy ticks per period. This is the largest amount of embassy ticks that fits into
+    /// the [u32] counter.
+    embassy_ticks_per_period: u32,
     /// Counter reset value. A period has `reset_value + 1` timer ticks.
     reset_value: u32,
 }
 
-impl TimekeeperPeriod {
+impl TimekeeperConfig {
     fn new(timer_clock_hz: u32) -> Self {
         assert!(
             TICK_HZ_U32 <= timer_clock_hz,
             "embassy TICK_HZ is higher than the timer clock"
         );
-        let scale = timer_clock_hz / TICK_HZ_U32;
-        let ticks = u32::MAX / scale;
+        let timer_ticks_per_embassy_tick = timer_clock_hz / TICK_HZ_U32;
+        let embassy_ticks_per_period = u32::MAX / timer_ticks_per_embassy_tick;
         Self {
-            scale,
-            ticks,
-            reset_value: ticks * scale - 1,
+            timer_ticks_per_embassy_tick,
+            embassy_ticks_per_period,
+            reset_value: embassy_ticks_per_period * timer_ticks_per_embassy_tick - 1,
         }
     }
 
+    /// Embassy timestamp at the given period.
+    ///
+    /// One period is a timer reset for the given timekeeper configuration, so this is just the
+    /// periods times the embassy ticks per period.
     fn ticks_at_period(&self, period: u32) -> u64 {
-        period as u64 * self.ticks as u64
+        period as u64 * self.embassy_ticks_per_period as u64
     }
 }
 
@@ -122,13 +128,11 @@ impl TimerDriver {
 
         let mut timekeeper_reg_block = unsafe { TimekeeperTim::ID.steal_regs() };
         let mut alarm_tim_reg_block = unsafe { AlarmTim::ID.steal_regs() };
-        // Initiate scale value here. This is required to convert timer ticks back to a timestamp.
-        SCALE.set((sysclk.to_raw() / TICK_HZ_U32) as u64).unwrap();
-        let period = TimekeeperPeriod::new(sysclk.to_raw());
-        timekeeper_reg_block.write_reset_value(period.reset_value);
+        let timekeeper_config = TimekeeperConfig::new(sysclk.to_raw());
+        timekeeper_reg_block.write_reset_value(timekeeper_config.reset_value);
         // Decrementing counter.
-        timekeeper_reg_block.write_count_value(period.reset_value);
-        PERIOD.set(period).ok();
+        timekeeper_reg_block.write_count_value(timekeeper_config.reset_value);
+        TIMEKEEPER_CONFIG.set(timekeeper_config).ok();
         let irqsel = unsafe { va108xx::Irqsel::steal() };
         // Switch on. Timekeeping should always be done.
         irqsel
@@ -180,16 +184,11 @@ impl TimerDriver {
         enable_tim_clk(TimekeeperTim::ID);
         assert_tim_reset_for_cycles(TimekeeperTim::ID, 2);
 
-        // Initiate scale value here. This is required to convert timer ticks back to a timestamp.
-
-        SCALE
-            .set((TimekeeperTim::clock(clocks).to_raw() / TICK_HZ_U32) as u64)
-            .unwrap();
-        let period = TimekeeperPeriod::new(TimekeeperTim::clock(clocks).to_raw());
-        timekeeper_regs.write_reset_value(period.reset_value);
+        let timekeeper_config = TimekeeperConfig::new(TimekeeperTim::clock(clocks).to_raw());
+        timekeeper_regs.write_reset_value(timekeeper_config.reset_value);
         // Decrementing counter.
-        timekeeper_regs.write_count_value(period.reset_value);
-        PERIOD.set(period).ok();
+        timekeeper_regs.write_count_value(timekeeper_config.reset_value);
+        TIMEKEEPER_CONFIG.set(timekeeper_config).ok();
         // Switch on. Timekeeping should always be done.
         unsafe {
             enable_nvic_interrupt(TimekeeperTim::IRQ);
@@ -240,7 +239,7 @@ impl TimerDriver {
     ///
     /// # Safety
     ///
-    ///This function has to be called once by the TIM IRQ used for the timekeeping.
+    /// This function has to be called once by the TIM IRQ used for the alarm handling.
     pub unsafe fn on_interrupt_alarm(&self) {
         critical_section::with(|cs| {
             if self.alarms.borrow(cs).timestamp.get() <= self.now() {
@@ -251,16 +250,19 @@ impl TimerDriver {
 
     fn next_period(&self) {
         let period = self.periods.fetch_add(1, Ordering::AcqRel) + 1;
-        let t = PERIOD.get().unwrap().ticks_at_period(period);
+        let timekeeper_config = TIMEKEEPER_CONFIG.get().unwrap();
+        let embassy_ticks = timekeeper_config.ticks_at_period(period);
         critical_section::with(|cs| {
             let alarm = &self.alarms.borrow(cs);
             let at = alarm.timestamp.get();
-            if at < t {
+            if at < embassy_ticks {
                 self.trigger_alarm(cs);
             } else {
                 let mut alarm_tim = Self::alarm_tim();
 
-                let remaining_ticks = (at - t).checked_mul(*SCALE.get().unwrap());
+                let remaining_ticks = (at - embassy_ticks)
+                    .checked_mul(timekeeper_config.timer_ticks_per_embassy_tick as u64);
+                // Arm the alarm timer once it is in counter range.
                 if remaining_ticks.is_some_and(|v| v <= u32::MAX as u64) {
                     alarm_tim.write_enable_control(EnableControl::new_disable());
                     alarm_tim.write_count_value(remaining_ticks.unwrap() as u32);
@@ -301,9 +303,9 @@ impl TimerDriver {
     }
 
     fn set_alarm(&self, cs: CriticalSection, timestamp: u64) -> bool {
-        if SCALE.get().is_none() {
+        let Some(timekeeper_config) = TIMEKEEPER_CONFIG.get() else {
             return false;
-        }
+        };
         let mut alarm_tim = Self::alarm_tim();
         alarm_tim.modify_control(|mut value| {
             value.set_irq_enable(false);
@@ -331,7 +333,8 @@ impl TimerDriver {
         // by the Alarm trait contract. What's not allowed is triggering alarms *before* their scheduled time,
         // and we don't do that here.
         let safe_timestamp = timestamp.max(t + 3);
-        let timer_ticks = (safe_timestamp - t).checked_mul(*SCALE.get().unwrap());
+        let timer_ticks =
+            (safe_timestamp - t).checked_mul(timekeeper_config.timer_ticks_per_embassy_tick as u64);
         alarm_tim.write_reset_value(u32::MAX);
         if timer_ticks.is_some_and(|v| v <= u32::MAX as u64) {
             alarm_tim.write_count_value(timer_ticks.unwrap() as u32);
@@ -350,7 +353,7 @@ impl TimerDriver {
 
 impl Driver for TimerDriver {
     fn now(&self) -> u64 {
-        let Some(period) = PERIOD.get() else {
+        let Some(timekeeper_config) = TIMEKEEPER_CONFIG.get() else {
             return 0;
         };
         let mut period1: u32;
@@ -362,12 +365,13 @@ impl Driver for TimerDriver {
             // no instructions can be reordered before the load.
             period1 = self.periods.load(Ordering::Acquire);
 
-            counter_val = period.reset_value - Self::timekeeper_tim().read_count_value();
+            counter_val = timekeeper_config.reset_value - Self::timekeeper_tim().read_count_value();
 
             // Double read to protect against race conditions when the counter is overflowing.
             period2 = self.periods.load(Ordering::Relaxed);
             if period1 == period2 {
-                return period.ticks_at_period(period1) + (counter_val / period.scale) as u64;
+                return timekeeper_config.ticks_at_period(period1)
+                    + (counter_val / timekeeper_config.timer_ticks_per_embassy_tick) as u64;
             }
         }
     }
