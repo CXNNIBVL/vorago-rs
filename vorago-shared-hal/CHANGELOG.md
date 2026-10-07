@@ -82,6 +82,14 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Fixed
 
+- The embassy time driver no longer divides a 64-bit value in `now()`. That division is slow
+  in software on Cortex-M0, and its fast path ended with the first timekeeper overflow, after
+  roughly 86 s at 50 MHz. A timekeeper period is now a whole number of embassy ticks.
+- Alarms are no longer triggered early at every timekeeper overflow. `next_period` compared
+  timer ticks with embassy ticks.
+- The embassy time driver now rejects an invalid `TICK_HZ` instead of dividing by zero. A
+  `TICK_HZ` that does not fit in a `u32` is a compile error. A `TICK_HZ` higher than the timer
+  clock panics at init.
 - Hardware chip select is now deasserted at the end of an async SPI transfer. Previously the
   async driver disabled blockmode and never set the BMSTART_BMSTOP bit, so CS stayed asserted.
 - Cancelling an async SPI transfer now ends the blockmode frame. Dropping a transfer future only
