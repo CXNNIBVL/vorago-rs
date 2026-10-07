@@ -45,6 +45,15 @@ impl AlarmState {
 
 unsafe impl Send for AlarmState {}
 
+/// [`TICK_HZ`] as a u32. Checked at compile time.
+const TICK_HZ_U32: u32 = {
+    assert!(
+        TICK_HZ <= u32::MAX as u64,
+        "embassy TICK_HZ does not fit in u32"
+    );
+    TICK_HZ as u32
+};
+
 static SCALE: OnceCell<u64> = OnceCell::new();
 /// Timekeeper geometry, see [`TimekeeperPeriod`].
 static PERIOD: OnceCell<TimekeeperPeriod> = OnceCell::new();
@@ -65,12 +74,11 @@ struct TimekeeperPeriod {
 
 impl TimekeeperPeriod {
     fn new(timer_clock_hz: u32) -> Self {
-        let tick_hz = u32::try_from(TICK_HZ).expect("embassy TICK_HZ does not fit in u32");
         assert!(
-            tick_hz <= timer_clock_hz,
+            TICK_HZ_U32 <= timer_clock_hz,
             "embassy TICK_HZ is higher than the timer clock"
         );
-        let scale = timer_clock_hz / tick_hz;
+        let scale = timer_clock_hz / TICK_HZ_U32;
         let ticks = u32::MAX / scale;
         Self {
             scale,
@@ -116,9 +124,7 @@ impl TimerDriver {
         let mut timekeeper_reg_block = unsafe { TimekeeperTim::ID.steal_regs() };
         let mut alarm_tim_reg_block = unsafe { AlarmTim::ID.steal_regs() };
         // Initiate scale value here. This is required to convert timer ticks back to a timestamp.
-        SCALE
-            .set((sysclk.to_raw() / TICK_HZ as u32) as u64)
-            .unwrap();
+        SCALE.set((sysclk.to_raw() / TICK_HZ_U32) as u64).unwrap();
         let period = TimekeeperPeriod::new(sysclk.to_raw());
         timekeeper_reg_block.write_reset_value(period.reset_value);
         // Decrementing counter.
@@ -178,7 +184,7 @@ impl TimerDriver {
         // Initiate scale value here. This is required to convert timer ticks back to a timestamp.
 
         SCALE
-            .set((TimekeeperTim::clock(clocks).to_raw() / TICK_HZ as u32) as u64)
+            .set((TimekeeperTim::clock(clocks).to_raw() / TICK_HZ_U32) as u64)
             .unwrap();
         let period = TimekeeperPeriod::new(TimekeeperTim::clock(clocks).to_raw());
         timekeeper_regs.write_reset_value(period.reset_value);
