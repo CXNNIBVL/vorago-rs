@@ -65,7 +65,12 @@ struct TimekeeperPeriod {
 
 impl TimekeeperPeriod {
     fn new(timer_clock_hz: u32) -> Self {
-        let scale = timer_clock_hz / TICK_HZ as u32;
+        let tick_hz = u32::try_from(TICK_HZ).expect("embassy TICK_HZ does not fit in u32");
+        assert!(
+            tick_hz <= timer_clock_hz,
+            "embassy TICK_HZ is higher than the timer clock"
+        );
+        let scale = timer_clock_hz / tick_hz;
         let ticks = u32::MAX / scale;
         Self {
             scale,
