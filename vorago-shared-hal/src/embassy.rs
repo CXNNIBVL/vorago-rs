@@ -87,8 +87,7 @@ impl TimekeeperPeriod {
         }
     }
 
-    /// Embassy ticks at the start of `period`.
-    fn start(&self, period: u32) -> u64 {
+    fn ticks_at_period(&self, period: u32) -> u64 {
         period as u64 * self.ticks as u64
     }
 }
@@ -252,7 +251,7 @@ impl TimerDriver {
 
     fn next_period(&self) {
         let period = self.periods.fetch_add(1, Ordering::AcqRel) + 1;
-        let t = PERIOD.get().unwrap().start(period);
+        let t = PERIOD.get().unwrap().ticks_at_period(period);
         critical_section::with(|cs| {
             let alarm = &self.alarms.borrow(cs);
             let at = alarm.timestamp.get();
@@ -368,7 +367,7 @@ impl Driver for TimerDriver {
             // Double read to protect against race conditions when the counter is overflowing.
             period2 = self.periods.load(Ordering::Relaxed);
             if period1 == period2 {
-                return period.start(period1) + (counter_val / period.scale) as u64;
+                return period.ticks_at_period(period1) + (counter_val / period.scale) as u64;
             }
         }
     }
